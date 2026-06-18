@@ -1,0 +1,46 @@
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: shrink-pvc
+  annotations:
+    artifacthub.io/license: Apache-2.0
+spec:
+  version: "{{ .TagName }}"
+  homepage: https://git.keatsfonam.com/lab/kubectl-shrink-pvc
+  shortDescription: Shrink filesystem PVCs by copying data through a smaller PVC
+  description: |
+    kubectl-shrink-pvc shrinks a filesystem PersistentVolumeClaim by creating a
+    smaller temporary PVC, copying data into it, and optionally replacing the
+    original PVC. Kubernetes cannot shrink bound volumes in place, so original
+    PVC deletion and recreation is gated behind --replace-original.
+  caveats: |
+    This plugin can delete and recreate the original PVC when --replace-original
+    is set. Always review a --dry-run first and keep backups for important data.
+
+    v1 supports same-namespace filesystem PVCs and can automatically scale
+    Deployment consumers. StatefulSet and other unsupported consumers are refused.
+  platforms:
+  - selector:
+      matchLabels:
+        os: linux
+        arch: amd64
+    {{addURIAndSha "https://git.keatsfonam.com/lab/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_linux_amd64.tar.gz" .TagName }}
+    bin: kubectl-shrink_pvc
+  - selector:
+      matchLabels:
+        os: linux
+        arch: arm64
+    {{addURIAndSha "https://git.keatsfonam.com/lab/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_linux_arm64.tar.gz" .TagName }}
+    bin: kubectl-shrink_pvc
+  - selector:
+      matchLabels:
+        os: darwin
+        arch: amd64
+    {{addURIAndSha "https://git.keatsfonam.com/lab/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_darwin_amd64.tar.gz" .TagName }}
+    bin: kubectl-shrink_pvc
+  - selector:
+      matchLabels:
+        os: darwin
+        arch: arm64
+    {{addURIAndSha "https://git.keatsfonam.com/lab/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_darwin_arm64.tar.gz" .TagName }}
+    bin: kubectl-shrink_pvc

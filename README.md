@@ -23,6 +23,22 @@ install -m 0755 kubectl-shrink_pvc /usr/local/bin/kubectl-shrink_pvc
 kubectl shrink-pvc --help
 ```
 
+## Krew packaging
+
+This repository includes a root `.krew.yaml` manifest template for the eventual Krew index entry. Build release archives that match the template with:
+
+```sh
+make release-archives VERSION=v0.1.0
+```
+
+Upload the generated `dist/kubectl-shrink-pvc_<version>_<os>_<arch>.tar.gz` archives to the release referenced by `.krew.yaml`, then render/test the manifest before submitting `shrink-pvc.yaml` to `krew-index`:
+
+```sh
+kubectl krew install --manifest=shrink-pvc.yaml --archive=dist/kubectl-shrink-pvc_v0.1.0_linux_amd64.tar.gz
+```
+
+Before submission, ensure the release URLs in `.krew.yaml` match the public release host. The release archives include the binary, `README.md`, and `LICENSE`.
+
 ## Usage
 
 Plan only:
