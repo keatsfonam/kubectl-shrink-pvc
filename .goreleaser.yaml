@@ -1,0 +1,38 @@
+version: 2
+
+project_name: kubectl-shrink-pvc
+
+builds:
+  - main: ./cmd/kubectl-shrink_pvc
+    binary: kubectl-shrink_pvc
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  # Krew expects tar.gz on every platform, and the name must stay in sync
+  # with the addURIAndSha URLs in .krew.yaml.
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Tag }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github-native
