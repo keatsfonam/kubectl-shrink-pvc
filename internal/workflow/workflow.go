@@ -16,11 +16,11 @@ import (
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
 
-	"git.keatsfonam.com/lab/kubectl-shrink-pvc/internal/datamover"
-	"git.keatsfonam.com/lab/kubectl-shrink-pvc/internal/inspect"
-	"git.keatsfonam.com/lab/kubectl-shrink-pvc/internal/kube"
-	"git.keatsfonam.com/lab/kubectl-shrink-pvc/internal/naming"
-	"git.keatsfonam.com/lab/kubectl-shrink-pvc/internal/pvcmanifest"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/datamover"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/inspect"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/kube"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/naming"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/pvcmanifest"
 )
 
 type Config struct {

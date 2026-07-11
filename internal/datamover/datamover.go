@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"git.keatsfonam.com/lab/kubectl-shrink-pvc/internal/naming"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/naming"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"

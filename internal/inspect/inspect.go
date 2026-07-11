@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"git.keatsfonam.com/lab/kubectl-shrink-pvc/internal/naming"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/naming"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"

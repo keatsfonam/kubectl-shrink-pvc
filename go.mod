@@ -1,4 +1,4 @@
-module git.keatsfonam.com/lab/kubectl-shrink-pvc
+module github.com/keatsfonam/kubectl-shrink-pvc
 
 go 1.24
 

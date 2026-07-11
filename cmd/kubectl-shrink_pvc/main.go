@@ -9,8 +9,8 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 
-	"git.keatsfonam.com/lab/kubectl-shrink-pvc/internal/datamover"
-	"git.keatsfonam.com/lab/kubectl-shrink-pvc/internal/workflow"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/datamover"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/workflow"
 )
 
 func main() {
