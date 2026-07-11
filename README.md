@@ -1,5 +1,7 @@
 # kubectl-shrink-pvc
 
+[![ci](https://github.com/keatsfonam/kubectl-shrink-pvc/actions/workflows/ci.yml/badge.svg)](https://github.com/keatsfonam/kubectl-shrink-pvc/actions/workflows/ci.yml)
+
 `kubectl-shrink-pvc` is a kubectl plugin that shrinks a filesystem PVC by copying its data through a temporary smaller PVC. Kubernetes cannot shrink an existing bound volume in place, so the replacement phase is intentionally gated behind an explicit flag.
 
 ## Status
@@ -15,29 +17,24 @@ Initial implementation:
 - Source usage inspection is included before copying
 - Original PVC deletion/recreation requires `--replace-original`
 
-## Install locally
+## Install
+
+Download the archive for your platform from the [releases page](https://github.com/keatsfonam/kubectl-shrink-pvc/releases), unpack it, and put `kubectl-shrink_pvc` on your `PATH`:
 
 ```sh
-go build -o kubectl-shrink_pvc ./cmd/kubectl-shrink_pvc
+tar -xzf kubectl-shrink-pvc_v0.1.0_darwin_arm64.tar.gz
 install -m 0755 kubectl-shrink_pvc /usr/local/bin/kubectl-shrink_pvc
 kubectl shrink-pvc --help
 ```
 
-## Krew packaging
-
-This repository includes a root `.krew.yaml` manifest template for the eventual Krew index entry. Build release archives that match the template with:
+Or build from source:
 
 ```sh
-make release-archives VERSION=v0.1.0
+go build -o kubectl-shrink_pvc ./cmd/kubectl-shrink_pvc
+install -m 0755 kubectl-shrink_pvc /usr/local/bin/kubectl-shrink_pvc
 ```
 
-Upload the generated `dist/kubectl-shrink-pvc_<version>_<os>_<arch>.tar.gz` archives to the release referenced by `.krew.yaml`, then render/test the manifest before submitting `shrink-pvc.yaml` to `krew-index`:
-
-```sh
-kubectl krew install --manifest=shrink-pvc.yaml --archive=dist/kubectl-shrink-pvc_v0.1.0_linux_amd64.tar.gz
-```
-
-Before submission, ensure the release URLs in `.krew.yaml` match the public release host. The release archives include the binary, `README.md`, and `LICENSE`.
+The plugin is not in the Krew index yet. `.krew.yaml` at the repo root is the manifest template for that submission; release archives are built to match it.
 
 ## Usage
 
@@ -111,3 +108,7 @@ Use `--keep-temp` for cautious runs until you are comfortable with the workflow.
 - Static PVs with selectors or specialized binding requirements may need manual handling.
 - Inspect and rsync pods set no node affinity; for `ReadWriteOnce` volumes on multi-node clusters, they may hang until `--wait-timeout` if scheduled away from the node where the volume can attach.
 - Deployment replica restoration uses the replica count captured during discovery; it can fight an HPA that manages the same Deployment.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
