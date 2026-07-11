@@ -162,7 +162,7 @@ func podLogs(ctx context.Context, client kubernetes.Interface, namespace, name s
 		}
 		return "", fmt.Errorf("get inspection pod logs: %w", err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	b, err := io.ReadAll(stream)
 	if err != nil {
 		return "", fmt.Errorf("read inspection pod logs: %w", err)
