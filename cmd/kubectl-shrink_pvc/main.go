@@ -13,6 +13,9 @@ import (
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/workflow"
 )
 
+// Overridden at release time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	if err := newRootCmd().ExecuteContext(context.Background()); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -38,6 +41,7 @@ func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "kubectl-shrink_pvc PVC --size TARGET_SIZE",
 		Short:        "Shrink a Kubernetes PVC by copying data through a temporary PVC",
+		Version:      version,
 		SilenceUsage: true,
 		Args:         cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
