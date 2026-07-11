@@ -86,8 +86,13 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 	}
 
 	if err := waitForJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval); err != nil {
-		logs, _ := jobLogs(context.Background(), m.Client, req.Namespace, runName)
-		_ = cleanupJob(context.Background(), m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval)
+		// Fetch logs and clean up on a fresh context so a cancelled caller
+		// (Ctrl-C) does not leave the failed job behind, but bound it so a
+		// broken API server cannot hang the exit path.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), req.WaitTimeout)
+		defer cancel()
+		logs, _ := jobLogs(cleanupCtx, m.Client, req.Namespace, runName)
+		_ = cleanupJob(cleanupCtx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval)
 		if logs != "" {
 			return fmt.Errorf("%w; logs: %s", err, logs)
 		}
