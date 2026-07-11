@@ -4,6 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # The k8s.io modules are versioned in lockstep and cannot be
+      # bumped one at a time.
+      kubernetes:
+        patterns:
+          - k8s.io/*
   - package-ecosystem: github-actions
     directory: /
     schedule:
