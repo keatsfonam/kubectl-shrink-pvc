@@ -3,10 +3,10 @@ kind: Plugin
 metadata:
   name: shrink-pvc
   annotations:
-    artifacthub.io/license: Apache-2.0
+    artifacthub.io/license: MIT
 spec:
   version: "{{ .TagName }}"
-  homepage: https://git.keatsfonam.com/lab/kubectl-shrink-pvc
+  homepage: https://github.com/keatsfonam/kubectl-shrink-pvc
   shortDescription: Shrink filesystem PVCs by copying data through a smaller PVC
   description: |
     kubectl-shrink-pvc shrinks a filesystem PersistentVolumeClaim by creating a
@@ -24,23 +24,29 @@ spec:
       matchLabels:
         os: linux
         arch: amd64
-    {{addURIAndSha "https://git.keatsfonam.com/lab/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_linux_amd64.tar.gz" .TagName }}
+    {{addURIAndSha "https://github.com/keatsfonam/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_linux_amd64.tar.gz" .TagName }}
     bin: kubectl-shrink_pvc
   - selector:
       matchLabels:
         os: linux
         arch: arm64
-    {{addURIAndSha "https://git.keatsfonam.com/lab/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_linux_arm64.tar.gz" .TagName }}
+    {{addURIAndSha "https://github.com/keatsfonam/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_linux_arm64.tar.gz" .TagName }}
     bin: kubectl-shrink_pvc
   - selector:
       matchLabels:
         os: darwin
         arch: amd64
-    {{addURIAndSha "https://git.keatsfonam.com/lab/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_darwin_amd64.tar.gz" .TagName }}
+    {{addURIAndSha "https://github.com/keatsfonam/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_darwin_amd64.tar.gz" .TagName }}
     bin: kubectl-shrink_pvc
   - selector:
       matchLabels:
         os: darwin
         arch: arm64
-    {{addURIAndSha "https://git.keatsfonam.com/lab/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_darwin_arm64.tar.gz" .TagName }}
+    {{addURIAndSha "https://github.com/keatsfonam/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_darwin_arm64.tar.gz" .TagName }}
     bin: kubectl-shrink_pvc
+  - selector:
+      matchLabels:
+        os: windows
+        arch: amd64
+    {{addURIAndSha "https://github.com/keatsfonam/kubectl-shrink-pvc/releases/download/{{ .TagName }}/kubectl-shrink-pvc_{{ .TagName }}_windows_amd64.tar.gz" .TagName }}
+    bin: kubectl-shrink_pvc.exe
