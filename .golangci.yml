@@ -1,0 +1,17 @@
+version: "2"
+
+linters:
+  enable:
+    - misspell
+    - unconvert
+  settings:
+    errcheck:
+      # Progress output to the user; nothing sensible to do if a print fails.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
+formatters:
+  enable:
+    - gofmt
