@@ -3,6 +3,7 @@ package workflow
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -43,13 +44,16 @@ type Config struct {
 // Status checks do not need to be configurable.
 const pollInterval = 2 * time.Second
 
-func Run(ctx context.Context, cfg Config) error {
+func Run(ctx context.Context, cfg Config) (retErr error) {
 	client, namespace, err := kube.Clientset(cfg.ConfigFlags)
 	if err != nil {
 		return err
 	}
 	if cfg.SafetyMarginPercent < 0 {
 		return fmt.Errorf("--safety-margin must be non-negative")
+	}
+	if cfg.Timeout <= 0 {
+		return fmt.Errorf("--timeout must be positive")
 	}
 	if cfg.RunAsUser == 0 {
 		return fmt.Errorf("--run-as-user must be a non-zero UID; omit it to run as root")
@@ -114,8 +118,12 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		fmt.Fprintln(cfg.IOStreams.Out, "Restoring Deployment replica counts...")
-		if err := kube.RestoreDeployments(context.Background(), client, plan.Deployments); err != nil {
-			fmt.Fprintf(cfg.IOStreams.ErrOut, "Warning: failed to restore Deployment replicas: %v\n", err)
+		restoreCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+		defer cancel()
+		if err := kube.RestoreDeployments(restoreCtx, client, plan.Deployments); err != nil {
+			restoreErr := fmt.Errorf("restore Deployment replicas: %w", err)
+			fmt.Fprintf(cfg.IOStreams.ErrOut, "Warning: %v\n", restoreErr)
+			retErr = errors.Join(retErr, restoreErr)
 		}
 	}()
 
@@ -174,7 +182,6 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	restoreOnExit = false
 	fmt.Fprintf(cfg.IOStreams.Out, "Deleting original PVC %s/%s...\n", namespace, cfg.PVCName)
 	if err := client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, cfg.PVCName, metav1.DeleteOptions{}); err != nil {
 		return fmt.Errorf("delete original PVC: %w", err)
@@ -182,6 +189,9 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := kube.WaitForPVCDeleted(ctx, client, namespace, cfg.PVCName, cfg.Timeout, pollInterval); err != nil {
 		return err
 	}
+	// Once deletion is confirmed, restoring consumers would start pods against a
+	// missing claim. Keep them stopped until the replacement and copy-back finish.
+	restoreOnExit = false
 
 	finalPVC, err := pvcmanifest.Build(source, cfg.PVCName, target)
 	if err != nil {

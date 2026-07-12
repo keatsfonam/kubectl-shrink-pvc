@@ -41,8 +41,7 @@ func scaleDeployment(ctx context.Context, client kubernetes.Interface, dep Deplo
 
 func restoreDeploymentSet(ctx context.Context, client kubernetes.Interface, deps []DeploymentRef) error {
 	var errs []error
-	for i := len(deps) - 1; i >= 0; i-- {
-		dep := deps[i]
+	for _, dep := range deps {
 		if err := scaleDeployment(ctx, client, dep, dep.Replicas); err != nil {
 			errs = append(errs, err)
 		}
@@ -51,12 +50,7 @@ func restoreDeploymentSet(ctx context.Context, client kubernetes.Interface, deps
 }
 
 func RestoreDeployments(ctx context.Context, client kubernetes.Interface, deps []DeploymentRef) error {
-	for _, dep := range deps {
-		if err := ScaleDeployments(ctx, client, []DeploymentRef{dep}, dep.Replicas); err != nil {
-			return err
-		}
-	}
-	return nil
+	return restoreDeploymentSet(ctx, client, deps)
 }
 
 func WaitForPVCUnmounted(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, timeout, poll time.Duration) error {

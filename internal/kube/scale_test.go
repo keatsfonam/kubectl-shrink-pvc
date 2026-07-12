@@ -36,6 +36,34 @@ func TestWaitForPVCDeletedAcceptsNotFound(t *testing.T) {
 	}
 }
 
+func TestRestoreDeploymentsAttemptsEveryDeployment(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	var updates []string
+	client.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		get := action.(clienttesting.GetAction)
+		return true, &autoscalingv1.Scale{ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: get.GetNamespace()}}, nil
+	})
+	client.PrependReactor("update", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		scale := action.(clienttesting.UpdateAction).GetObject().(*autoscalingv1.Scale)
+		updates = append(updates, scale.Name)
+		if scale.Name == "first" {
+			return true, nil, errors.New("first restore failed")
+		}
+		return true, scale, nil
+	})
+
+	err := RestoreDeployments(context.Background(), client, []DeploymentRef{
+		{Namespace: "ns", Name: "first", Replicas: 3},
+		{Namespace: "ns", Name: "second", Replicas: 2},
+	})
+	if err == nil || !strings.Contains(err.Error(), "first restore failed") {
+		t.Fatalf("expected restore error, got %v", err)
+	}
+	if want := []string{"first", "second"}; !reflect.DeepEqual(updates, want) {
+		t.Fatalf("unexpected restore attempts: got %v, want %v", updates, want)
+	}
+}
+
 func TestScaleDeploymentsRollsBackPartialFailure(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	replicas := map[string]int32{"first": 3, "second": 2}
