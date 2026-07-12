@@ -8,6 +8,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 )
@@ -69,14 +70,17 @@ func WaitForPVCUnmounted(ctx context.Context, client kubernetes.Interface, names
 	return err
 }
 
-func WaitForPVCDeleted(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, timeout, poll time.Duration) error {
+func WaitForPVCDeleted(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, expectedUID types.UID, timeout, poll time.Duration) error {
 	err := wait.PollUntilContextTimeout(ctx, poll, timeout, true, func(ctx context.Context) (bool, error) {
-		_, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
+		pvc, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return true, nil
 		}
 		if err != nil {
 			return false, fmt.Errorf("get PVC while waiting for deletion: %w", err)
+		}
+		if expectedUID != "" && pvc.UID != expectedUID {
+			return false, fmt.Errorf("PVC %s/%s was replaced while waiting for deletion: expected UID %s, found %s", namespace, pvcName, expectedUID, pvc.UID)
 		}
 		return false, nil
 	})

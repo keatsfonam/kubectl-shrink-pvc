@@ -56,6 +56,7 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "print the execution plan without changing the cluster")
 	cmd.Flags().BoolVar(&cfg.KeepTemp, "keep-temp", cfg.KeepTemp, "keep the temporary PVC after success")
 	cmd.Flags().BoolVar(&cfg.NoScale, "no-scale", cfg.NoScale, "do not scale Deployments; require workloads to already be stopped")
+	cmd.Flags().BoolVar(&cfg.Resume, "resume", cfg.Resume, "resume the persisted operation for this PVC")
 	cmd.Flags().StringVar(&cfg.TempName, "temp-name", cfg.TempName, "temporary PVC name (default: generated from source name)")
 	cmd.Flags().StringVar(&cfg.Image, "image", cfg.Image, "image used for the inspection pod and rsync copy jobs")
 	cmd.Flags().StringVar(&cfg.RsyncExtraArgs, "rsync-extra-args", cfg.RsyncExtraArgs, "extra arguments appended to rsync copy commands")

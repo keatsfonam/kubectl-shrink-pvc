@@ -10,6 +10,7 @@ import (
 	"time"
 
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -22,7 +23,7 @@ func TestWaitForPVCDeletedPropagatesAPIErrors(t *testing.T) {
 		return true, nil, errors.New("API unavailable")
 	})
 
-	err := WaitForPVCDeleted(context.Background(), client, "ns", "data", time.Second, time.Millisecond)
+	err := WaitForPVCDeleted(context.Background(), client, "ns", "data", "uid", time.Second, time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "API unavailable") {
 		t.Fatalf("expected API error, got %v", err)
 	}
@@ -31,7 +32,7 @@ func TestWaitForPVCDeletedPropagatesAPIErrors(t *testing.T) {
 func TestWaitForPVCDeletedAcceptsNotFound(t *testing.T) {
 	client := fake.NewSimpleClientset()
 
-	if err := WaitForPVCDeleted(context.Background(), client, "ns", "missing", time.Second, time.Millisecond); err != nil {
+	if err := WaitForPVCDeleted(context.Background(), client, "ns", "missing", "uid", time.Second, time.Millisecond); err != nil {
 		t.Fatalf("expected missing PVC to count as deleted: %v", err)
 	}
 }
@@ -61,6 +62,15 @@ func TestRestoreDeploymentsAttemptsEveryDeployment(t *testing.T) {
 	}
 	if want := []string{"first", "second"}; !reflect.DeepEqual(updates, want) {
 		t.Fatalf("unexpected restore attempts: got %v, want %v", updates, want)
+	}
+}
+
+func TestWaitForPVCDeletedRejectsReplacement(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "ns", UID: "replacement"}})
+
+	err := WaitForPVCDeleted(context.Background(), client, "ns", "data", "original", time.Second, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "was replaced") {
+		t.Fatalf("expected replacement error, got %v", err)
 	}
 }
 

@@ -9,7 +9,28 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/operation"
 )
+
+func TestResumeRejectsChangedTarget(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	store := operation.Store{Client: client, Namespace: "ns", Name: operation.NameForPVC("data")}
+	state := &operation.State{
+		Version: 1, OperationID: "op", Namespace: "ns", SourceName: "data",
+		OriginalSourceUID: "source", TempName: "temp", TempUID: "temp-uid",
+		TargetSize: "1Gi", Image: "image", RunAsUser: -1, FSGroup: -1,
+		Phase: operation.PhaseCopiedToTemp,
+	}
+	if _, err := store.Create(context.Background(), state); err != nil {
+		t.Fatalf("create state: %v", err)
+	}
+
+	err := resume(context.Background(), Config{PVCName: "data", Image: "image", RunAsUser: -1, FSGroup: -1}, client, "ns", resource.MustParse("2Gi"))
+	if err == nil || !strings.Contains(err.Error(), "persisted operation target") {
+		t.Fatalf("expected target mismatch, got %v", err)
+	}
+}
 
 func TestRequiredBytesWithMargin(t *testing.T) {
 	tests := []struct {
@@ -80,8 +101,9 @@ func TestEnsureTemporaryPVCReusesExistingMatchingSize(t *testing.T) {
 func ownedTempPVC(name, namespace, size, sourceUID, sourceName string) *corev1.PersistentVolumeClaim {
 	claim := pvc(name, namespace, size)
 	claim.Annotations = map[string]string{
-		tempSourceUIDAnnotation:  sourceUID,
-		tempSourceNameAnnotation: sourceName,
+		tempSourceUIDAnnotation:         sourceUID,
+		tempSourceNameAnnotation:        sourceName,
+		operation.AnnotationOperationID: "test-operation",
 	}
 	return claim
 }

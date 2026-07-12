@@ -3,6 +3,7 @@ package workflow
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -21,6 +22,7 @@ import (
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/inspect"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/kube"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/naming"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/operation"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/pvcmanifest"
 )
 
@@ -31,6 +33,7 @@ type Config struct {
 	DryRun              bool
 	KeepTemp            bool
 	NoScale             bool
+	Resume              bool
 	TempName            string
 	Image               string
 	RsyncExtraArgs      string
@@ -71,6 +74,9 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	target, err := resource.ParseQuantity(cfg.TargetSize)
 	if err != nil {
 		return fmt.Errorf("parse --size %q: %w", cfg.TargetSize, err)
+	}
+	if cfg.Resume {
+		return resume(ctx, cfg, client, namespace, target)
 	}
 
 	source, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, cfg.PVCName, metav1.GetOptions{})
@@ -114,6 +120,10 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	}
 
 	source, plan, err = revalidateExecutionPlan(ctx, client, namespace, cfg.PVCName, source, plan, cfg.NoScale)
+	if err != nil {
+		return err
+	}
+	operationID, err := operation.NewID()
 	if err != nil {
 		return err
 	}
@@ -178,6 +188,12 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	}
 	tempPVC.Annotations[tempSourceUIDAnnotation] = string(source.UID)
 	tempPVC.Annotations[tempSourceNameAnnotation] = source.Name
+	tempPVC.Annotations[operation.AnnotationOperationID] = operationID
+	finalPVC, err := pvcmanifest.Build(source, cfg.PVCName, target)
+	if err != nil {
+		return err
+	}
+	operation.StampRecreatedPVC(finalPVC, operationID)
 	fmt.Fprintf(cfg.IOStreams.Out, "Creating temporary PVC %s/%s...\n", namespace, cfg.TempName)
 	tempPVC, reused, err := ensureTemporaryPVC(ctx, client, namespace, tempPVC, target)
 	if err != nil {
@@ -198,27 +214,55 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		return err
 	}
 
-	if err := validateDestructiveBoundary(ctx, client, namespace, cfg.PVCName, source.UID); err != nil {
+	finalPVCJSON, err := json.Marshal(finalPVC)
+	if err != nil {
+		return fmt.Errorf("encode replacement PVC: %w", err)
+	}
+	state := &operation.State{
+		Version: 1, OperationID: operationID, Namespace: namespace, SourceName: cfg.PVCName,
+		OriginalSourceUID: source.UID, TempName: cfg.TempName, TempUID: tempPVC.UID,
+		TargetSize: target.String(), Image: cfg.Image, RsyncExtraArgs: cfg.RsyncExtraArgs,
+		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup, KeepTemp: cfg.KeepTemp, NoScale: cfg.NoScale,
+		Deployments: plan.Deployments, FinalPVCJSON: finalPVCJSON, Phase: operation.PhaseCopiedToTemp,
+	}
+	store := operation.Store{Client: client, Namespace: namespace, Name: operation.NameForPVC(cfg.PVCName)}
+	stateCM, err := store.Create(ctx, state)
+	if err != nil {
+		return err
+	}
+	stateResourceVersion := stateCM.ResourceVersion
+	updatePhase := func(phase operation.Phase) error {
+		state.Phase = phase
+		var updateErr error
+		stateResourceVersion, updateErr = store.Update(ctx, state, stateResourceVersion)
+		return updateErr
+	}
+
+	if err := validateDestructiveBoundary(ctx, client, namespace, cfg.PVCName, source.UID, plan.Deployments, cfg.NoScale); err != nil {
 		return err
 	}
 	fmt.Fprintf(cfg.IOStreams.Out, "Deleting original PVC %s/%s...\n", namespace, cfg.PVCName)
 	if err := kube.DeletePVC(ctx, client, namespace, cfg.PVCName, source.UID); err != nil {
 		return err
 	}
-	if err := kube.WaitForPVCDeleted(ctx, client, namespace, cfg.PVCName, cfg.Timeout, pollInterval); err != nil {
+	if err := kube.WaitForPVCDeleted(ctx, client, namespace, cfg.PVCName, source.UID, cfg.Timeout, pollInterval); err != nil {
 		return err
 	}
 	// Once deletion is confirmed, restoring consumers would start pods against a
 	// missing claim. Keep them stopped until the replacement and copy-back finish.
 	restoreOnExit = false
-
-	finalPVC, err := pvcmanifest.Build(source, cfg.PVCName, target)
-	if err != nil {
+	if err := updatePhase(operation.PhaseSourceDeleted); err != nil {
 		return err
 	}
+
 	fmt.Fprintf(cfg.IOStreams.Out, "Recreating original PVC %s/%s at %s...\n", namespace, cfg.PVCName, target.String())
-	if _, err := client.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, finalPVC, metav1.CreateOptions{}); err != nil {
+	recreated, err := client.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, finalPVC, metav1.CreateOptions{})
+	if err != nil {
 		return fmt.Errorf("recreate original PVC: %w", err)
+	}
+	state.RecreatedSourceUID = recreated.UID
+	if err := updatePhase(operation.PhaseSourceRecreated); err != nil {
+		return err
 	}
 
 	fmt.Fprintf(cfg.IOStreams.Out, "Copying %s -> %s...\n", cfg.TempName, cfg.PVCName)
@@ -231,12 +275,27 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		return err
 	}
 	restoreOnExit = true
+	if err := updatePhase(operation.PhaseCopiedBack); err != nil {
+		return err
+	}
+	if scaled {
+		restoreCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+		err := kube.RestoreDeployments(restoreCtx, client, plan.Deployments)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("restore Deployment replicas: %w", err)
+		}
+		scaled = false
+	}
 
 	if !cfg.KeepTemp {
 		fmt.Fprintf(cfg.IOStreams.Out, "Deleting temporary PVC %s/%s...\n", namespace, cfg.TempName)
 		if err := kube.DeletePVC(ctx, client, namespace, cfg.TempName, tempPVC.UID); err != nil {
 			return err
 		}
+	}
+	if err := store.Delete(ctx, stateCM.UID); err != nil {
+		return err
 	}
 
 	fmt.Fprintln(cfg.IOStreams.Out, "PVC shrink workflow completed successfully.")
@@ -292,7 +351,7 @@ func revalidateExecutionPlan(ctx context.Context, client kubernetes.Interface, n
 	return currentSource, refreshed, nil
 }
 
-func validateDestructiveBoundary(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, expectedUID types.UID) error {
+func validateDestructiveBoundary(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, expectedUID types.UID, deployments []kube.DeploymentRef, noScale bool) error {
 	current, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("revalidate source PVC before deletion: %w", err)
@@ -306,6 +365,24 @@ func validateDestructiveBoundary(ctx context.Context, client kubernetes.Interfac
 	}
 	if len(pods) > 0 {
 		return fmt.Errorf("PVC %s/%s gained active consumers before deletion: %v", namespace, pvcName, pods)
+	}
+	if !noScale {
+		for _, dep := range deployments {
+			scale, err := client.AppsV1().Deployments(dep.Namespace).GetScale(ctx, dep.Name, metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("verify scale for Deployment %s/%s before deletion: %w", dep.Namespace, dep.Name, err)
+			}
+			if scale.Spec.Replicas != 0 {
+				return fmt.Errorf("deployment %s/%s was rescaled to %d before deletion", dep.Namespace, dep.Name, scale.Spec.Replicas)
+			}
+		}
+	}
+	hpas, err := kube.DiscoverDeploymentHPAs(ctx, client, deployments)
+	if err != nil {
+		return err
+	}
+	if len(hpas) > 0 {
+		return fmt.Errorf("a HorizontalPodAutoscaler appeared before deletion; refusing to continue")
 	}
 	return nil
 }
@@ -382,7 +459,8 @@ func ensureTemporaryPVC(ctx context.Context, client kubernetes.Interface, namesp
 			return nil, false, fmt.Errorf("get existing temp PVC %s/%s: %w", namespace, tempPVC.Name, getErr)
 		}
 		if existing.Annotations[tempSourceUIDAnnotation] != tempPVC.Annotations[tempSourceUIDAnnotation] ||
-			existing.Annotations[tempSourceNameAnnotation] != tempPVC.Annotations[tempSourceNameAnnotation] {
+			existing.Annotations[tempSourceNameAnnotation] != tempPVC.Annotations[tempSourceNameAnnotation] ||
+			existing.Annotations[operation.AnnotationOperationID] != tempPVC.Annotations[operation.AnnotationOperationID] {
 			return nil, false, fmt.Errorf("temporary PVC %s/%s already exists but is not owned by this source PVC; choose a different --temp-name", namespace, tempPVC.Name)
 		}
 		existingSize := pvcmanifest.CurrentSize(existing)

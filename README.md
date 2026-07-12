@@ -56,6 +56,7 @@ Useful flags:
 
 - `--keep-temp`: keep the temporary PVC after a successful shrink.
 - `--no-scale`: do not scale Deployments; require the PVC to already be unmounted.
+- `--resume`: continue a persisted replacement after an interruption; use the same `--size`, image, UID, and rsync settings as the original run.
 - `--temp-name`: choose the temporary PVC name.
 - `--image`: image for the inspection pod and rsync copy jobs; needs `rsync`, `du`, and `/bin/sh`. Default: `instrumentisto/rsync-ssh:alpine3.23-r3@sha256:6cbad37c2fbdca4ac7ad9d1c1bb8990af9efd4dc76321b349935876cbb1e9e4a`.
 - `--safety-margin`: require this additional percentage of measured source usage to fit in the target PVC before copying. Default: `10`.
@@ -77,8 +78,9 @@ The tool runs in phases:
 7. Run an inspection pod that mounts the source PVC read-only and measures usage with `du`.
 8. Create a temporary PVC at the target size.
 9. Copy source PVC data to the temporary PVC with rsync.
-10. Delete and recreate the original PVC at the new size, then copy the data back.
-11. Restore Deployment replica counts.
+10. Persist recovery state in a ConfigMap before deleting the original PVC.
+11. Delete and recreate the original PVC at the new size, then copy the data back.
+12. Restore Deployment replica counts and remove the recovery state.
 
 The inspection step catches obvious "data cannot fit" cases before migration. By default, the measured usage must fit with a 10% safety margin (`--safety-margin`) to leave room for destination filesystem overhead. Rsync and the destination filesystem remain authoritative; sparse files, filesystem overhead, or unusual metadata can still cause the copy to fail. Copy failures before the original PVC is deleted leave it untouched.
 
@@ -86,14 +88,13 @@ The inspection step catches obvious "data cannot fit" cases before migration. By
 
 If the command fails before the original PVC is deleted (validation, inspection, or the copy to the temporary PVC), the original PVC remains intact.
 
-If it fails after the original PVC is deleted and before completion:
+After the source-to-temporary copy succeeds, the plugin persists a ConfigMap named `<pvc>-shrink-state`. If the command is interrupted during replacement or restoration, rerun it with the original options plus `--resume`, for example:
 
-1. Keep the temporary PVC; it contains the copied data if source-to-temp completed.
-2. Recreate the original PVC manually or rerun once the issue is resolved.
-3. Copy data from the temporary PVC back to the original PVC.
-4. Restore Deployment replicas manually if the tool could not restore them.
+```sh
+kubectl shrink-pvc data --size 20Gi -n app --resume
+```
 
-Use `--keep-temp` for cautious runs until you are comfortable with the workflow.
+Resume validates PVC UIDs and operation annotations before adopting or deleting anything. An unrelated same-name PVC is never deleted. Keep the state ConfigMap and temporary PVC until recovery completes; successful completion removes the state automatically. Use `--keep-temp` for cautious runs until you are comfortable with the workflow.
 
 ## Limitations
 
