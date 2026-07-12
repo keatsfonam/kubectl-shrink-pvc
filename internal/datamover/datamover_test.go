@@ -5,6 +5,14 @@ import (
 	"testing"
 )
 
+func TestJobDisablesServiceAccountToken(t *testing.T) {
+	job := buildJob(Request{Namespace: "ns", SourcePVC: "source", DestPVC: "dest", Image: "image", RunAsUser: -1, FSGroup: -1}, "job", "rsync /src/ /dest/", false, 0)
+	value := job.Spec.Template.Spec.AutomountServiceAccountToken
+	if value == nil || *value {
+		t.Fatal("rsync Job must disable service account token automount")
+	}
+}
+
 func TestRsyncCommand(t *testing.T) {
 	cmd := rsyncCommand("--partial", false)
 	for _, want := range []string{"rsync", "-aHAX", "--numeric-ids", "--exclude=lost+found", "--delete", "--info=progress2", "--partial", "/src/", "/dest/"} {

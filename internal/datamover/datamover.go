@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 )
 
 const DefaultImage = "instrumentisto/rsync-ssh:alpine3.23-r3@sha256:6cbad37c2fbdca4ac7ad9d1c1bb8990af9efd4dc76321b349935876cbb1e9e4a"
@@ -43,36 +44,7 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 	nonRoot := req.RunAsUser >= 0
 	cmd := rsyncCommand(req.ExtraArgs, nonRoot)
 
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: runName, Namespace: req.Namespace},
-		Spec: batchv1.JobSpec{
-			BackoffLimit: &backoff,
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "kubectl-shrink-pvc", "shrink-pvc-job": runName}},
-				Spec: corev1.PodSpec{
-					RestartPolicy:   corev1.RestartPolicyNever,
-					SecurityContext: podsec.Pod(req.RunAsUser, req.FSGroup),
-					Containers: []corev1.Container{{
-						Name:    "rsync",
-						Image:   req.Image,
-						Command: []string{"/bin/sh", "-c", cmd},
-						// Root mode keeps just the capabilities rsync -aHAX
-						// needs to preserve arbitrary ownership, modes,
-						// xattrs, and device nodes.
-						SecurityContext: podsec.Container(nonRoot, "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "MKNOD"),
-						VolumeMounts: []corev1.VolumeMount{
-							{Name: "source", MountPath: "/src", ReadOnly: true},
-							{Name: "dest", MountPath: "/dest"},
-						},
-					}},
-					Volumes: []corev1.Volume{
-						{Name: "source", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: req.SourcePVC, ReadOnly: true}}},
-						{Name: "dest", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: req.DestPVC}}},
-					},
-				},
-			},
-		},
-	}
+	job := buildJob(req, runName, cmd, nonRoot, backoff)
 
 	if _, err := m.Client.BatchV1().Jobs(req.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create rsync job: %w", err)
@@ -95,6 +67,37 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 		return err
 	}
 	return nil
+}
+
+func buildJob(req Request, runName, cmd string, nonRoot bool, backoff int32) *batchv1.Job {
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: runName, Namespace: req.Namespace},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: &backoff,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "kubectl-shrink-pvc", "shrink-pvc-job": runName}},
+				Spec: corev1.PodSpec{
+					RestartPolicy:                corev1.RestartPolicyNever,
+					AutomountServiceAccountToken: ptr.To(false),
+					SecurityContext:              podsec.Pod(req.RunAsUser, req.FSGroup),
+					Containers: []corev1.Container{{
+						Name:            "rsync",
+						Image:           req.Image,
+						Command:         []string{"/bin/sh", "-c", cmd},
+						SecurityContext: podsec.Container(nonRoot, "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "MKNOD"),
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "source", MountPath: "/src", ReadOnly: true},
+							{Name: "dest", MountPath: "/dest"},
+						},
+					}},
+					Volumes: []corev1.Volume{
+						{Name: "source", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: req.SourcePVC, ReadOnly: true}}},
+						{Name: "dest", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: req.DestPVC}}},
+					},
+				},
+			},
+		},
+	}
 }
 
 func rsyncCommand(extraArgs string, nonRoot bool) string {

@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 )
 
 type Options struct {
@@ -30,18 +31,44 @@ type Options struct {
 }
 
 func UsageBytes(ctx context.Context, client kubernetes.Interface, opts Options) (int64, error) {
+	pod := buildInspectionPod(opts)
+
+	created, err := client.CoreV1().Pods(opts.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("create inspection pod: %w", err)
+	}
+	defer func() {
+		_ = cleanupPod(context.Background(), client, opts.Namespace, created.Name, opts.WaitTimeout, opts.PollInterval)
+	}()
+
+	if err := waitForPodCompletion(ctx, client, opts.Namespace, created.Name, opts.WaitTimeout, opts.PollInterval); err != nil {
+		logs, _ := podLogs(context.Background(), client, opts.Namespace, created.Name)
+		if logs != "" {
+			return 0, fmt.Errorf("%w; logs: %s", err, logs)
+		}
+		return 0, err
+	}
+
+	logs, err := podLogs(ctx, client, opts.Namespace, created.Name)
+	if err != nil {
+		return 0, err
+	}
+	return ParseUsageBytes(logs)
+}
+
+func buildInspectionPod(opts Options) *corev1.Pod {
 	generateName := ""
 	if opts.PodName == "" {
 		generateName = naming.SafeDNSLabel(opts.PVCName+"-shrink-inspect") + "-"
 	} else {
 		opts.PodName = naming.SafeDNSLabel(opts.PodName)
 	}
-
-	pod := &corev1.Pod{
+	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: opts.PodName, GenerateName: generateName, Namespace: opts.Namespace},
 		Spec: corev1.PodSpec{
-			RestartPolicy:   corev1.RestartPolicyNever,
-			SecurityContext: podsec.Pod(opts.RunAsUser, opts.FSGroup),
+			RestartPolicy:                corev1.RestartPolicyNever,
+			AutomountServiceAccountToken: ptr.To(false),
+			SecurityContext:              podsec.Pod(opts.RunAsUser, opts.FSGroup),
 			Containers: []corev1.Container{{
 				Name:    "inspect",
 				Image:   opts.Image,
@@ -66,28 +93,6 @@ func UsageBytes(ctx context.Context, client kubernetes.Interface, opts Options) 
 			}},
 		},
 	}
-
-	created, err := client.CoreV1().Pods(opts.Namespace).Create(ctx, pod, metav1.CreateOptions{})
-	if err != nil {
-		return 0, fmt.Errorf("create inspection pod: %w", err)
-	}
-	defer func() {
-		_ = cleanupPod(context.Background(), client, opts.Namespace, created.Name, opts.WaitTimeout, opts.PollInterval)
-	}()
-
-	if err := waitForPodCompletion(ctx, client, opts.Namespace, created.Name, opts.WaitTimeout, opts.PollInterval); err != nil {
-		logs, _ := podLogs(context.Background(), client, opts.Namespace, created.Name)
-		if logs != "" {
-			return 0, fmt.Errorf("%w; logs: %s", err, logs)
-		}
-		return 0, err
-	}
-
-	logs, err := podLogs(ctx, client, opts.Namespace, created.Name)
-	if err != nil {
-		return 0, err
-	}
-	return ParseUsageBytes(logs)
 }
 
 func ParseUsageBytes(logs string) (int64, error) {

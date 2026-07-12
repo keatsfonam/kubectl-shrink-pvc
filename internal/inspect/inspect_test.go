@@ -2,6 +2,13 @@ package inspect
 
 import "testing"
 
+func TestInspectionPodDisablesServiceAccountToken(t *testing.T) {
+	pod := buildInspectionPod(Options{Namespace: "ns", PVCName: "data", Image: "image", RunAsUser: -1, FSGroup: -1})
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Fatal("inspection pod must disable service account token automount")
+	}
+}
+
 func TestParseUsageBytes(t *testing.T) {
 	tests := []struct {
 		name string
