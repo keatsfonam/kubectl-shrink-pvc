@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,17 +12,41 @@ import (
 )
 
 func ScaleDeployments(ctx context.Context, client kubernetes.Interface, deps []DeploymentRef, replicas int32) error {
+	scaled := make([]DeploymentRef, 0, len(deps))
 	for _, dep := range deps {
-		scale, err := client.AppsV1().Deployments(dep.Namespace).GetScale(ctx, dep.Name, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("get scale for Deployment %s/%s: %w", dep.Namespace, dep.Name, err)
+		if err := scaleDeployment(ctx, client, dep, replicas); err != nil {
+			rollbackErr := restoreDeploymentSet(ctx, client, scaled)
+			if rollbackErr != nil {
+				return errors.Join(err, fmt.Errorf("roll back partially scaled Deployments: %w", rollbackErr))
+			}
+			return err
 		}
-		scale.Spec.Replicas = replicas
-		if _, err := client.AppsV1().Deployments(dep.Namespace).UpdateScale(ctx, dep.Name, scale, metav1.UpdateOptions{}); err != nil {
-			return fmt.Errorf("scale Deployment %s/%s to %d: %w", dep.Namespace, dep.Name, replicas, err)
-		}
+		scaled = append(scaled, dep)
 	}
 	return nil
+}
+
+func scaleDeployment(ctx context.Context, client kubernetes.Interface, dep DeploymentRef, replicas int32) error {
+	scale, err := client.AppsV1().Deployments(dep.Namespace).GetScale(ctx, dep.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get scale for Deployment %s/%s: %w", dep.Namespace, dep.Name, err)
+	}
+	scale.Spec.Replicas = replicas
+	if _, err := client.AppsV1().Deployments(dep.Namespace).UpdateScale(ctx, dep.Name, scale, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("scale Deployment %s/%s to %d: %w", dep.Namespace, dep.Name, replicas, err)
+	}
+	return nil
+}
+
+func restoreDeploymentSet(ctx context.Context, client kubernetes.Interface, deps []DeploymentRef) error {
+	var errs []error
+	for i := len(deps) - 1; i >= 0; i-- {
+		dep := deps[i]
+		if err := scaleDeployment(ctx, client, dep, dep.Replicas); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func RestoreDeployments(ctx context.Context, client kubernetes.Interface, deps []DeploymentRef) error {
