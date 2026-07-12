@@ -1,6 +1,6 @@
 PLUGIN := kubectl-shrink_pvc
 
-.PHONY: build test vet fmt lint snapshot clean
+.PHONY: build test vet fmt lint e2e snapshot clean
 
 build:
 	go build -o $(PLUGIN) ./cmd/kubectl-shrink_pvc
@@ -16,6 +16,9 @@ fmt:
 
 lint:
 	golangci-lint run
+
+e2e:
+	hack/e2e.sh
 
 snapshot:
 	goreleaser release --snapshot --clean

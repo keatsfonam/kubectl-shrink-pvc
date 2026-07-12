@@ -28,6 +28,16 @@ jobs:
           go-version: stable
       - uses: golangci/golangci-lint-action@v9
 
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - uses: helm/kind-action@v1
+      - run: hack/e2e.sh
+
   release-snapshot:
     runs-on: ubuntu-latest
     steps:

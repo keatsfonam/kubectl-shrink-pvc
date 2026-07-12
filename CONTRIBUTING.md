@@ -8,6 +8,7 @@ Development uses plain Go tooling:
 make build   # build the plugin binary
 make test    # go test ./...
 make lint    # golangci-lint run
+make e2e     # end-to-end suite; needs a kind cluster as the current context
 ```
 
 CI runs vet, tests, lint, and a goreleaser snapshot build on every pull request. Please make sure `make test` and `make lint` pass before sending a PR.
