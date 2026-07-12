@@ -27,6 +27,7 @@ jobs:
         with:
           go-version: stable
       - uses: golangci/golangci-lint-action@v9
+      - run: shellcheck hack/*.sh
 
   e2e:
     runs-on: ubuntu-latest

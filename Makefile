@@ -16,6 +16,7 @@ fmt:
 
 lint:
 	golangci-lint run
+	shellcheck hack/*.sh
 
 e2e:
 	hack/e2e.sh

@@ -71,11 +71,12 @@ spec:
           persistentVolumeClaim:
             claimName: $pvc
 EOF
-	kubectl -n $ns rollout status deploy/app-$pvc --timeout=180s
+	kubectl -n $ns rollout status deploy/app-"$pvc" --timeout=180s
 }
 
 seed() {
-	kubectl -n $ns exec deploy/app-$1 -- sh -c '
+	# shellcheck disable=SC2016  # $i expands inside the pod's shell
+	kubectl -n $ns exec deploy/app-"$1" -- sh -c '
 		mkdir -p /data/files
 		i=1
 		while [ $i -le 3 ]; do
@@ -86,7 +87,7 @@ seed() {
 }
 
 checksum() {
-	kubectl -n $ns exec deploy/app-$1 -- sh -c 'cat /data/files/blob* | md5sum | cut -d" " -f1'
+	kubectl -n $ns exec deploy/app-"$1" -- sh -c 'cat /data/files/blob* | md5sum | cut -d" " -f1'
 }
 
 pvc_size() {
