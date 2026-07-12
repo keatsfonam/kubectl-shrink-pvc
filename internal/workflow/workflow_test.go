@@ -36,9 +36,9 @@ func TestRequiredBytesWithMargin(t *testing.T) {
 }
 
 func TestEnsureTemporaryPVCRejectsExistingWrongSize(t *testing.T) {
-	client := fake.NewSimpleClientset(pvc("data-shrink", "ns", "1Gi"))
+	client := fake.NewSimpleClientset(ownedTempPVC("data-shrink", "ns", "1Gi", "source-uid", "data"))
 	target := resource.MustParse("2Gi")
-	tempPVC := pvc("data-shrink", "ns", "2Gi")
+	tempPVC := ownedTempPVC("data-shrink", "ns", "2Gi", "source-uid", "data")
 
 	_, err := ensureTemporaryPVC(context.Background(), client, "ns", tempPVC, target)
 	if err == nil {
@@ -49,10 +49,21 @@ func TestEnsureTemporaryPVCRejectsExistingWrongSize(t *testing.T) {
 	}
 }
 
-func TestEnsureTemporaryPVCReusesExistingMatchingSize(t *testing.T) {
+func TestEnsureTemporaryPVCRejectsExistingWithoutOwnership(t *testing.T) {
 	client := fake.NewSimpleClientset(pvc("data-shrink", "ns", "2Gi"))
 	target := resource.MustParse("2Gi")
-	tempPVC := pvc("data-shrink", "ns", "2Gi")
+	tempPVC := ownedTempPVC("data-shrink", "ns", "2Gi", "source-uid", "data")
+
+	_, err := ensureTemporaryPVC(context.Background(), client, "ns", tempPVC, target)
+	if err == nil || !strings.Contains(err.Error(), "not owned by this source PVC") {
+		t.Fatalf("expected ownership error, got %v", err)
+	}
+}
+
+func TestEnsureTemporaryPVCReusesExistingMatchingSize(t *testing.T) {
+	client := fake.NewSimpleClientset(ownedTempPVC("data-shrink", "ns", "2Gi", "source-uid", "data"))
+	target := resource.MustParse("2Gi")
+	tempPVC := ownedTempPVC("data-shrink", "ns", "2Gi", "source-uid", "data")
 
 	reused, err := ensureTemporaryPVC(context.Background(), client, "ns", tempPVC, target)
 	if err != nil {
@@ -61,6 +72,15 @@ func TestEnsureTemporaryPVCReusesExistingMatchingSize(t *testing.T) {
 	if !reused {
 		t.Fatal("expected existing matching temp PVC to be reused")
 	}
+}
+
+func ownedTempPVC(name, namespace, size, sourceUID, sourceName string) *corev1.PersistentVolumeClaim {
+	claim := pvc(name, namespace, size)
+	claim.Annotations = map[string]string{
+		tempSourceUIDAnnotation:  sourceUID,
+		tempSourceNameAnnotation: sourceName,
+	}
+	return claim
 }
 
 func pvc(name, namespace, size string) *corev1.PersistentVolumeClaim {

@@ -41,8 +41,13 @@ type Config struct {
 	ConfigFlags         *genericclioptions.ConfigFlags
 }
 
-// Status checks do not need to be configurable.
-const pollInterval = 2 * time.Second
+const (
+	// Status checks do not need to be configurable.
+	pollInterval = 2 * time.Second
+
+	tempSourceUIDAnnotation  = "shrink-pvc.keats.dev/source-uid"
+	tempSourceNameAnnotation = "shrink-pvc.keats.dev/source-name"
+)
 
 func Run(ctx context.Context, cfg Config) (retErr error) {
 	client, namespace, err := kube.Clientset(cfg.ConfigFlags)
@@ -162,6 +167,11 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	if err != nil {
 		return err
 	}
+	if tempPVC.Annotations == nil {
+		tempPVC.Annotations = map[string]string{}
+	}
+	tempPVC.Annotations[tempSourceUIDAnnotation] = string(source.UID)
+	tempPVC.Annotations[tempSourceNameAnnotation] = source.Name
 	fmt.Fprintf(cfg.IOStreams.Out, "Creating temporary PVC %s/%s...\n", namespace, cfg.TempName)
 	reused, err := ensureTemporaryPVC(ctx, client, namespace, tempPVC, target)
 	if err != nil {
@@ -293,6 +303,10 @@ func ensureTemporaryPVC(ctx context.Context, client kubernetes.Interface, namesp
 		existing, getErr := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, tempPVC.Name, metav1.GetOptions{})
 		if getErr != nil {
 			return false, fmt.Errorf("get existing temp PVC %s/%s: %w", namespace, tempPVC.Name, getErr)
+		}
+		if existing.Annotations[tempSourceUIDAnnotation] != tempPVC.Annotations[tempSourceUIDAnnotation] ||
+			existing.Annotations[tempSourceNameAnnotation] != tempPVC.Annotations[tempSourceNameAnnotation] {
+			return false, fmt.Errorf("temporary PVC %s/%s already exists but is not owned by this source PVC; choose a different --temp-name", namespace, tempPVC.Name)
 		}
 		existingSize := pvcmanifest.CurrentSize(existing)
 		if existingSize.Cmp(target) != 0 {
