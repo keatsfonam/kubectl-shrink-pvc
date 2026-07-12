@@ -104,7 +104,8 @@ Use `--keep-temp` for cautious runs until you are comfortable with the workflow.
 - Static PVs with selectors or specialized binding requirements may need manual handling.
 - Namespaces that enforce the `restricted` PodSecurity profile reject the default root inspect/copy pods; use `--run-as-user` there and accept that file ownership is not preserved.
 - Inspect and rsync pods set no node affinity; for `ReadWriteOnce` volumes on multi-node clusters, they may hang until `--timeout` if scheduled away from the node where the volume can attach.
-- Deployment replica restoration uses the replica count captured during discovery; it can fight an HPA that manages the same Deployment.
+- HorizontalPodAutoscalers targeting a Deployment consumer must be suspended before the workflow starts; the plugin refuses to continue while one is active.
+- Consumer ownership, replica counts, and the source PVC UID are revalidated after confirmation and immediately before deletion.
 
 ## License
 

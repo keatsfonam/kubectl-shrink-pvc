@@ -13,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
 
@@ -112,6 +113,11 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		}
 	}
 
+	source, plan, err = revalidateExecutionPlan(ctx, client, namespace, cfg.PVCName, source, plan, cfg.NoScale)
+	if err != nil {
+		return err
+	}
+
 	scaled := false
 	restoreOnExit := true
 	defer func() {
@@ -192,6 +198,9 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		return err
 	}
 
+	if err := validateDestructiveBoundary(ctx, client, namespace, cfg.PVCName, source.UID); err != nil {
+		return err
+	}
 	fmt.Fprintf(cfg.IOStreams.Out, "Deleting original PVC %s/%s...\n", namespace, cfg.PVCName)
 	if err := kube.DeletePVC(ctx, client, namespace, cfg.PVCName, source.UID); err != nil {
 		return err
@@ -231,6 +240,73 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	}
 
 	fmt.Fprintln(cfg.IOStreams.Out, "PVC shrink workflow completed successfully.")
+	return nil
+}
+
+func revalidateExecutionPlan(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, source *corev1.PersistentVolumeClaim, approved *kube.ConsumerPlan, noScale bool) (*corev1.PersistentVolumeClaim, *kube.ConsumerPlan, error) {
+	currentSource, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("revalidate source PVC %s/%s: %w", namespace, pvcName, err)
+	}
+	if currentSource.UID != source.UID {
+		return nil, nil, fmt.Errorf("source PVC %s/%s was replaced after planning; rerun the command", namespace, pvcName)
+	}
+
+	fresh, err := kube.DiscoverConsumers(ctx, client, namespace, pvcName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("revalidate PVC consumers: %w", err)
+	}
+	if err := validateConsumers(fresh, noScale); err != nil {
+		return nil, nil, err
+	}
+	approvedDeployments := map[string]struct{}{}
+	for _, dep := range approved.Deployments {
+		approvedDeployments[dep.Namespace+"/"+dep.Name] = struct{}{}
+	}
+	for _, dep := range fresh.Deployments {
+		if _, ok := approvedDeployments[dep.Namespace+"/"+dep.Name]; !ok {
+			return nil, nil, fmt.Errorf("new Deployment consumer %s/%s appeared after confirmation; rerun the command", dep.Namespace, dep.Name)
+		}
+	}
+
+	refreshed := &kube.ConsumerPlan{Pods: fresh.Pods, Deployments: append([]kube.DeploymentRef(nil), approved.Deployments...)}
+	for i := range refreshed.Deployments {
+		dep := &refreshed.Deployments[i]
+		scale, err := client.AppsV1().Deployments(dep.Namespace).GetScale(ctx, dep.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, nil, fmt.Errorf("refresh scale for Deployment %s/%s: %w", dep.Namespace, dep.Name, err)
+		}
+		dep.Replicas = scale.Spec.Replicas
+	}
+	hpas, err := kube.DiscoverDeploymentHPAs(ctx, client, refreshed.Deployments)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(hpas) > 0 {
+		items := make([]string, 0, len(hpas))
+		for _, hpa := range hpas {
+			items = append(items, fmt.Sprintf("%s/%s -> Deployment %s/%s", hpa.Namespace, hpa.Name, hpa.Namespace, hpa.DeploymentName))
+		}
+		return nil, nil, fmt.Errorf("HorizontalPodAutoscalers target PVC consumers; suspend them and rerun: %s", strings.Join(items, ", "))
+	}
+	return currentSource, refreshed, nil
+}
+
+func validateDestructiveBoundary(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, expectedUID types.UID) error {
+	current, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("revalidate source PVC before deletion: %w", err)
+	}
+	if current.UID != expectedUID {
+		return fmt.Errorf("source PVC %s/%s was replaced before deletion; refusing to continue", namespace, pvcName)
+	}
+	pods, err := kube.ActivePodsUsingPVC(ctx, client, namespace, pvcName)
+	if err != nil {
+		return err
+	}
+	if len(pods) > 0 {
+		return fmt.Errorf("PVC %s/%s gained active consumers before deletion: %v", namespace, pvcName, pods)
+	}
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -42,6 +43,31 @@ func TestDiscoverConsumersFlagsStatefulSet(t *testing.T) {
 	}
 	if len(plan.Unsupported) != 1 || plan.Unsupported[0].Kind != "StatefulSet" || plan.Unsupported[0].Name != "db" {
 		t.Fatalf("expected StatefulSet unsupported consumer, got %#v", plan.Unsupported)
+	}
+}
+
+func TestDiscoverDeploymentHPAsFindsTargets(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		&autoscalingv2.HorizontalPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{Name: "web-hpa", Namespace: "ns"},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "apps/v1", Kind: "Deployment", Name: "web",
+			}},
+		},
+		&autoscalingv2.HorizontalPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{Name: "other-hpa", Namespace: "ns"},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "apps/v1", Kind: "Deployment", Name: "other",
+			}},
+		},
+	)
+
+	refs, err := DiscoverDeploymentHPAs(context.Background(), client, []DeploymentRef{{Namespace: "ns", Name: "web"}})
+	if err != nil {
+		t.Fatalf("DiscoverDeploymentHPAs returned error: %v", err)
+	}
+	if len(refs) != 1 || refs[0].Name != "web-hpa" || refs[0].DeploymentName != "web" {
+		t.Fatalf("unexpected HPA refs: %#v", refs)
 	}
 }
 

@@ -29,6 +29,12 @@ type ConsumerPlan struct {
 	Unsupported []UnsupportedConsumer
 }
 
+type HPARef struct {
+	Namespace      string
+	Name           string
+	DeploymentName string
+}
+
 func DiscoverConsumers(ctx context.Context, client kubernetes.Interface, namespace, pvcName string) (*ConsumerPlan, error) {
 	pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -76,6 +82,41 @@ func DiscoverConsumers(ctx context.Context, client kubernetes.Interface, namespa
 	})
 
 	return plan, nil
+}
+
+func DiscoverDeploymentHPAs(ctx context.Context, client kubernetes.Interface, deps []DeploymentRef) ([]HPARef, error) {
+	targetsByNamespace := map[string]map[string]struct{}{}
+	for _, dep := range deps {
+		if targetsByNamespace[dep.Namespace] == nil {
+			targetsByNamespace[dep.Namespace] = map[string]struct{}{}
+		}
+		targetsByNamespace[dep.Namespace][dep.Name] = struct{}{}
+	}
+
+	var refs []HPARef
+	for namespace, targets := range targetsByNamespace {
+		hpas, err := client.AutoscalingV2().HorizontalPodAutoscalers(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("list HorizontalPodAutoscalers in %s: %w", namespace, err)
+		}
+		for i := range hpas.Items {
+			hpa := &hpas.Items[i]
+			ref := hpa.Spec.ScaleTargetRef
+			if ref.Kind != "Deployment" || (ref.APIVersion != "" && ref.APIVersion != "apps/v1") {
+				continue
+			}
+			if _, ok := targets[ref.Name]; ok {
+				refs = append(refs, HPARef{Namespace: namespace, Name: hpa.Name, DeploymentName: ref.Name})
+			}
+		}
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].Namespace == refs[j].Namespace {
+			return refs[i].Name < refs[j].Name
+		}
+		return refs[i].Namespace < refs[j].Namespace
+	})
+	return refs, nil
 }
 
 func ActivePodsUsingPVC(ctx context.Context, client kubernetes.Interface, namespace, pvcName string) ([]string, error) {
