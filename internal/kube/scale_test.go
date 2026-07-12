@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -13,6 +15,26 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 )
+
+func TestWaitForPVCDeletedPropagatesAPIErrors(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("get", "persistentvolumeclaims", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("API unavailable")
+	})
+
+	err := WaitForPVCDeleted(context.Background(), client, "ns", "data", time.Second, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "API unavailable") {
+		t.Fatalf("expected API error, got %v", err)
+	}
+}
+
+func TestWaitForPVCDeletedAcceptsNotFound(t *testing.T) {
+	client := fake.NewSimpleClientset()
+
+	if err := WaitForPVCDeleted(context.Background(), client, "ns", "missing", time.Second, time.Millisecond); err != nil {
+		t.Fatalf("expected missing PVC to count as deleted: %v", err)
+	}
+}
 
 func TestScaleDeploymentsRollsBackPartialFailure(t *testing.T) {
 	client := fake.NewSimpleClientset()

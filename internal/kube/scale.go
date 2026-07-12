@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -77,7 +78,13 @@ func WaitForPVCUnmounted(ctx context.Context, client kubernetes.Interface, names
 func WaitForPVCDeleted(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, timeout, poll time.Duration) error {
 	err := wait.PollUntilContextTimeout(ctx, poll, timeout, true, func(ctx context.Context) (bool, error) {
 		_, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
-		return err != nil, nil
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("get PVC while waiting for deletion: %w", err)
+		}
+		return false, nil
 	})
 	if wait.Interrupted(err) && ctx.Err() == nil {
 		return fmt.Errorf("timed out waiting for PVC %s/%s deletion", namespace, pvcName)
