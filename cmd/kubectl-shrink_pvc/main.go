@@ -34,16 +34,19 @@ func newRootCmd() *cobra.Command {
 		InspectImage:        "alpine:3.20",
 		CopyImage:           datamover.DefaultImage,
 		SafetyMarginPercent: 10,
+		RunAsUser:           -1,
+		FSGroup:             -1,
 		WaitTimeout:         10 * time.Minute,
 		PollInterval:        2 * time.Second,
 	}
 
 	cmd := &cobra.Command{
-		Use:          "kubectl-shrink_pvc PVC --size TARGET_SIZE",
-		Short:        "Shrink a Kubernetes PVC by copying data through a temporary PVC",
-		Version:      version,
-		SilenceUsage: true,
-		Args:         cobra.ExactArgs(1),
+		Use:           "kubectl-shrink_pvc PVC --size TARGET_SIZE",
+		Short:         "Shrink a Kubernetes PVC by copying data through a temporary PVC",
+		Version:       version,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg.PVCName = args[0]
 			return workflow.Run(cmd.Context(), cfg)
@@ -62,6 +65,8 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.InspectImage, "inspect-image", cfg.InspectImage, "image used for the source usage inspection pod")
 	cmd.Flags().StringVar(&cfg.CopyImage, "copy-image", cfg.CopyImage, "image used for rsync copy jobs")
 	cmd.Flags().StringVar(&cfg.RsyncExtraArgs, "rsync-extra-args", cfg.RsyncExtraArgs, "extra arguments appended to rsync copy commands")
+	cmd.Flags().Int64Var(&cfg.RunAsUser, "run-as-user", cfg.RunAsUser, "run inspect and copy pods as this non-root UID; file ownership is not preserved (default: run as root)")
+	cmd.Flags().Int64Var(&cfg.FSGroup, "fs-group", cfg.FSGroup, "fsGroup for inspect and copy pods (default: the --run-as-user UID)")
 	cmd.Flags().IntVar(&cfg.SafetyMarginPercent, "safety-margin", cfg.SafetyMarginPercent, "additional percentage of measured source usage required as free space in the target PVC")
 	cmd.Flags().DurationVar(&cfg.WaitTimeout, "wait-timeout", cfg.WaitTimeout, "timeout for pods, jobs, PVC deletion, and workload scaling")
 	cmd.Flags().DurationVar(&cfg.PollInterval, "poll-interval", cfg.PollInterval, "interval between Kubernetes status checks")

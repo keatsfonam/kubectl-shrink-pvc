@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/naming"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/podsec"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +27,8 @@ type Request struct {
 	Image        string
 	JobName      string
 	ExtraArgs    string
+	RunAsUser    int64
+	FSGroup      int64
 	WaitTimeout  time.Duration
 	PollInterval time.Duration
 }
@@ -37,7 +40,8 @@ type RsyncMover struct {
 func (m RsyncMover) Move(ctx context.Context, req Request) error {
 	runName := uniqueName(req.JobName)
 	backoff := int32(0)
-	cmd := rsyncCommand(req.ExtraArgs)
+	nonRoot := req.RunAsUser >= 0
+	cmd := rsyncCommand(req.ExtraArgs, nonRoot)
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: runName, Namespace: req.Namespace},
@@ -46,11 +50,16 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "kubectl-shrink-pvc", "shrink-pvc-job": runName}},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					RestartPolicy:   corev1.RestartPolicyNever,
+					SecurityContext: podsec.Pod(req.RunAsUser, req.FSGroup),
 					Containers: []corev1.Container{{
 						Name:    "rsync",
 						Image:   req.Image,
 						Command: []string{"/bin/sh", "-c", cmd},
+						// Root mode keeps just the capabilities rsync -aHAX
+						// needs to preserve arbitrary ownership, modes,
+						// xattrs, and device nodes.
+						SecurityContext: podsec.Container(nonRoot, "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "MKNOD"),
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "source", MountPath: "/src", ReadOnly: true},
 							{Name: "dest", MountPath: "/dest"},
@@ -88,8 +97,17 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 	return nil
 }
 
-func rsyncCommand(extraArgs string) string {
-	cmd := "rsync -aHAX --numeric-ids --delete --info=progress2 " + extraArgs + " /src/ /dest/"
+func rsyncCommand(extraArgs string, nonRoot bool) string {
+	// Without root there is no way to preserve arbitrary owners, groups,
+	// exact modes, devices, or privileged xattrs, so copy content, links,
+	// and file times only. -p and dir times (-O) must stay off because
+	// chmod/utimes fail on the volume root a non-root user does not own.
+	// lost+found is fsck scratch space and root-only on ext4; never copy it.
+	base := "-aHAX --numeric-ids"
+	if nonRoot {
+		base = "-rlHt -O"
+	}
+	cmd := "rsync " + base + " --exclude=lost+found --delete --info=progress2 " + extraArgs + " /src/ /dest/"
 	return strings.Join(strings.Fields(cmd), " ")
 }
 

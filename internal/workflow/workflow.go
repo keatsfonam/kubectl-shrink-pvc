@@ -35,6 +35,8 @@ type Config struct {
 	InspectImage        string
 	CopyImage           string
 	RsyncExtraArgs      string
+	RunAsUser           int64
+	FSGroup             int64
 	SafetyMarginPercent int
 	WaitTimeout         time.Duration
 	PollInterval        time.Duration
@@ -49,6 +51,12 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if cfg.SafetyMarginPercent < 0 {
 		return fmt.Errorf("--safety-margin must be non-negative")
+	}
+	if cfg.RunAsUser == 0 {
+		return fmt.Errorf("--run-as-user must be a non-zero UID; omit it to run as root")
+	}
+	if cfg.FSGroup < 0 && cfg.RunAsUser > 0 {
+		cfg.FSGroup = cfg.RunAsUser
 	}
 
 	target, err := resource.ParseQuantity(cfg.TargetSize)
@@ -128,6 +136,7 @@ func Run(ctx context.Context, cfg Config) error {
 	fmt.Fprintln(cfg.IOStreams.Out, "Inspecting source PVC usage...")
 	usedBytes, err := inspect.UsageBytes(ctx, client, inspect.Options{
 		Namespace: namespace, PVCName: cfg.PVCName, Image: cfg.InspectImage,
+		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
 		WaitTimeout: cfg.WaitTimeout, PollInterval: cfg.PollInterval,
 	})
 	if err != nil {
@@ -160,6 +169,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := mover.Move(ctx, datamover.Request{
 		Namespace: namespace, SourcePVC: cfg.PVCName, DestPVC: cfg.TempName, Image: cfg.CopyImage,
 		JobName: naming.SafeDNSLabel("shrink-copy-to-temp-" + cfg.PVCName), ExtraArgs: cfg.RsyncExtraArgs,
+		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
 		WaitTimeout: cfg.WaitTimeout, PollInterval: cfg.PollInterval,
 	}); err != nil {
 		return err
@@ -193,6 +203,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := mover.Move(ctx, datamover.Request{
 		Namespace: namespace, SourcePVC: cfg.TempName, DestPVC: cfg.PVCName, Image: cfg.CopyImage,
 		JobName: naming.SafeDNSLabel("shrink-copy-back-" + cfg.PVCName), ExtraArgs: cfg.RsyncExtraArgs,
+		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
 		WaitTimeout: cfg.WaitTimeout, PollInterval: cfg.PollInterval,
 	}); err != nil {
 		return err

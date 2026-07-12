@@ -66,6 +66,8 @@ Useful flags:
 - `--copy-image`: image for rsync copy jobs. Default: `instrumentisto/rsync-ssh:alpine3.23-r3@sha256:6cbad37c2fbdca4ac7ad9d1c1bb8990af9efd4dc76321b349935876cbb1e9e4a`.
 - `--safety-margin`: require this additional percentage of measured source usage to fit in the target PVC before copying. Default: `10`.
 - `--rsync-extra-args`: append custom rsync arguments. The built-in rsync command already includes `--delete` so reused temp PVCs do not retain stale files.
+- `--run-as-user`: run the inspect and copy pods as this non-root UID so they satisfy the `restricted` PodSecurity profile. Copied files become owned by this UID with umask-derived modes, so it suits volumes owned by a single application user. Without it, pods run as root with a hardened context (seccomp `RuntimeDefault`, no privilege escalation, all capabilities dropped except the handful rsync and du need) and preserve ownership and modes exactly.
+- `--fs-group`: `fsGroup` for the inspect and copy pods. Defaults to the `--run-as-user` UID.
 - `--poll-interval`: interval between Kubernetes status checks. Default: `2s`.
 
 ## Safety model
@@ -106,6 +108,7 @@ Use `--keep-temp` for cautious runs until you are comfortable with the workflow.
 - Filesystem PVCs only; raw block PVCs are refused.
 - The built-in data mover is a simple same-namespace rsync Job that mounts both PVCs in one pod. This works for the initial Deployment-focused use case but is not as flexible as `pv-migrate` for cross-cluster or complex topology migrations. The copy image must contain `rsync` and `/bin/sh`.
 - Static PVs with selectors or specialized binding requirements may need manual handling.
+- Namespaces that enforce the `restricted` PodSecurity profile reject the default root inspect/copy pods; use `--run-as-user` there and accept that file ownership is not preserved.
 - Inspect and rsync pods set no node affinity; for `ReadWriteOnce` volumes on multi-node clusters, they may hang until `--wait-timeout` if scheduled away from the node where the volume can attach.
 - Deployment replica restoration uses the replica count captured during discovery; it can fight an HPA that manages the same Deployment.
 

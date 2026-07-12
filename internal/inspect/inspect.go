@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/naming"
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/podsec"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -22,6 +23,8 @@ type Options struct {
 	PVCName      string
 	Image        string
 	PodName      string
+	RunAsUser    int64
+	FSGroup      int64
 	WaitTimeout  time.Duration
 	PollInterval time.Duration
 }
@@ -37,11 +40,17 @@ func UsageBytes(ctx context.Context, client kubernetes.Interface, opts Options) 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: opts.PodName, GenerateName: generateName, Namespace: opts.Namespace},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
+			RestartPolicy:   corev1.RestartPolicyNever,
+			SecurityContext: podsec.Pod(opts.RunAsUser, opts.FSGroup),
 			Containers: []corev1.Container{{
 				Name:    "inspect",
 				Image:   opts.Image,
 				Command: []string{"/bin/sh", "-c", "du -sk /data | awk '{print $1 * 1024}'"},
+				// du has to stat every file regardless of owner. DAC_OVERRIDE
+				// rather than DAC_READ_SEARCH: only the former is on the
+				// baseline PodSecurity allowlist, and the volume is mounted
+				// read-only here anyway.
+				SecurityContext: podsec.Container(opts.RunAsUser >= 0, "DAC_OVERRIDE"),
 				VolumeMounts: []corev1.VolumeMount{{
 					Name:      "source",
 					MountPath: "/data",
