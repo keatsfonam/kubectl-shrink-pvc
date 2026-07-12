@@ -62,7 +62,7 @@ func TestBuildSanitizesPVC(t *testing.T) {
 }
 
 func TestTempNameTruncates(t *testing.T) {
-	got := TempName("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz", "shrink-tmp")
+	got := TempName("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz")
 	if len(got) > 63 {
 		t.Fatalf("name too long: %d", len(got))
 	}

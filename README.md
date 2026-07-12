@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/keatsfonam/kubectl-shrink-pvc/actions/workflows/ci.yml/badge.svg)](https://github.com/keatsfonam/kubectl-shrink-pvc/actions/workflows/ci.yml)
 
-`kubectl-shrink-pvc` is a kubectl plugin that shrinks a filesystem PVC by copying its data through a temporary smaller PVC. Kubernetes cannot shrink an existing bound volume in place, so the replacement phase is intentionally gated behind an explicit flag.
+`kubectl-shrink-pvc` is a kubectl plugin that shrinks a filesystem PVC by copying its data through a temporary smaller PVC. Kubernetes cannot shrink an existing bound volume in place, so the plugin recreates the original PVC at the new size — after showing you the plan and asking for confirmation.
 
 ## Status
 
@@ -15,14 +15,14 @@ Initial implementation:
 - Deployment consumers only for automatic scale-down / restore
 - StatefulSet consumers are detected and refused for now
 - Source usage inspection is included before copying
-- Original PVC deletion/recreation requires `--replace-original`
+- Prints the full plan and asks for confirmation before changing anything
 
 ## Install
 
 Download the archive for your platform from the [releases page](https://github.com/keatsfonam/kubectl-shrink-pvc/releases), unpack it, and put `kubectl-shrink_pvc` on your `PATH`:
 
 ```sh
-tar -xzf kubectl-shrink-pvc_v0.1.0_darwin_arm64.tar.gz
+tar -xzf kubectl-shrink-pvc_v0.3.0_darwin_arm64.tar.gz
 install -m 0755 kubectl-shrink_pvc /usr/local/bin/kubectl-shrink_pvc
 kubectl shrink-pvc --help
 ```
@@ -44,31 +44,25 @@ Plan only:
 kubectl shrink-pvc data --size 20Gi -n app --dry-run
 ```
 
-Safer first run: scale Deployment(s) down, inspect the source PVC, create a temporary smaller PVC, copy source data into it, then stop. The original PVC is not deleted.
+Real run: prints the same plan, asks for confirmation, then scales Deployment(s) down, inspects the source PVC, copies the data through a temporary smaller PVC, recreates the original at the new size, copies the data back, and restores the Deployment replicas.
 
 ```sh
-kubectl shrink-pvc data --size 20Gi -n app --yes
+kubectl shrink-pvc data --size 20Gi -n app
 ```
 
-Full replacement path: after the temp copy succeeds, delete and recreate the original PVC at the new size, then copy the data back.
-
-```sh
-kubectl shrink-pvc data --size 20Gi -n app --yes --replace-original
-```
+Pass `--yes` to skip the confirmation prompt, and `--keep-temp` to keep the intermediate copy around as a fallback.
 
 Useful flags:
 
-- `--replace-original`: opt in to deleting/recreating the original PVC.
-- `--keep-temp`: keep the temporary PVC after a successful replacement.
-- `--manual-scale`: do not scale Deployments; require the PVC to already be unmounted.
+- `--keep-temp`: keep the temporary PVC after a successful shrink.
+- `--no-scale`: do not scale Deployments; require the PVC to already be unmounted.
 - `--temp-name`: choose the temporary PVC name.
-- `--inspect-image`: image for the one-shot usage inspection pod. Default: `alpine:3.20`.
-- `--copy-image`: image for rsync copy jobs. Default: `instrumentisto/rsync-ssh:alpine3.23-r3@sha256:6cbad37c2fbdca4ac7ad9d1c1bb8990af9efd4dc76321b349935876cbb1e9e4a`.
+- `--image`: image for the inspection pod and rsync copy jobs; needs `rsync`, `du`, and `/bin/sh`. Default: `instrumentisto/rsync-ssh:alpine3.23-r3@sha256:6cbad37c2fbdca4ac7ad9d1c1bb8990af9efd4dc76321b349935876cbb1e9e4a`.
 - `--safety-margin`: require this additional percentage of measured source usage to fit in the target PVC before copying. Default: `10`.
 - `--rsync-extra-args`: append custom rsync arguments. The built-in rsync command already includes `--delete` so reused temp PVCs do not retain stale files.
 - `--run-as-user`: run the inspect and copy pods as this non-root UID so they satisfy the `restricted` PodSecurity profile. Copied files become owned by this UID with umask-derived modes, so it suits volumes owned by a single application user. Without it, pods run as root with a hardened context (seccomp `RuntimeDefault`, no privilege escalation, all capabilities dropped except the handful rsync and du need) and preserve ownership and modes exactly.
 - `--fs-group`: `fsGroup` for the inspect and copy pods. Defaults to the `--run-as-user` UID.
-- `--poll-interval`: interval between Kubernetes status checks. Default: `2s`.
+- `--timeout`: timeout for pods, jobs, PVC deletion, and workload scaling. Default: `10m`.
 
 ## Safety model
 
@@ -77,20 +71,20 @@ The tool runs in phases:
 1. Validate the source PVC and target size.
 2. Discover pods mounting the PVC.
 3. Refuse unsupported consumers such as StatefulSets in v1.
-4. Scale Deployment consumers to zero unless `--manual-scale` is set.
-5. Wait until the PVC is unmounted.
-6. Run an inspection pod that mounts the source PVC read-only and measures usage with `du`.
-7. Create a temporary PVC at the target size.
-8. Copy source PVC data to the temporary PVC with rsync.
-9. Stop unless `--replace-original` is set.
-10. If opted in, delete/recreate the original PVC and copy data back.
+4. Print the plan and wait for confirmation unless `--yes` is set.
+5. Scale Deployment consumers to zero unless `--no-scale` is set.
+6. Wait until the PVC is unmounted.
+7. Run an inspection pod that mounts the source PVC read-only and measures usage with `du`.
+8. Create a temporary PVC at the target size.
+9. Copy source PVC data to the temporary PVC with rsync.
+10. Delete and recreate the original PVC at the new size, then copy the data back.
 11. Restore Deployment replica counts.
 
-The inspection step catches obvious "data cannot fit" cases before migration. By default, the measured usage must fit with a 10% safety margin (`--safety-margin`) to leave room for destination filesystem overhead. Rsync and the destination filesystem remain authoritative; sparse files, filesystem overhead, or unusual metadata can still cause the copy to fail. In the default no-`--replace-original` mode, copy failures leave the original PVC untouched.
+The inspection step catches obvious "data cannot fit" cases before migration. By default, the measured usage must fit with a 10% safety margin (`--safety-margin`) to leave room for destination filesystem overhead. Rsync and the destination filesystem remain authoritative; sparse files, filesystem overhead, or unusual metadata can still cause the copy to fail. Copy failures before the original PVC is deleted leave it untouched.
 
 ## Recovery notes
 
-If the command fails before `--replace-original` deletes the original PVC, the original PVC should remain intact.
+If the command fails before the original PVC is deleted (validation, inspection, or the copy to the temporary PVC), the original PVC remains intact.
 
 If it fails after the original PVC is deleted and before completion:
 
@@ -109,7 +103,7 @@ Use `--keep-temp` for cautious runs until you are comfortable with the workflow.
 - The built-in data mover is a simple same-namespace rsync Job that mounts both PVCs in one pod. This works for the initial Deployment-focused use case but is not as flexible as `pv-migrate` for cross-cluster or complex topology migrations. The copy image must contain `rsync` and `/bin/sh`.
 - Static PVs with selectors or specialized binding requirements may need manual handling.
 - Namespaces that enforce the `restricted` PodSecurity profile reject the default root inspect/copy pods; use `--run-as-user` there and accept that file ownership is not preserved.
-- Inspect and rsync pods set no node affinity; for `ReadWriteOnce` volumes on multi-node clusters, they may hang until `--wait-timeout` if scheduled away from the node where the volume can attach.
+- Inspect and rsync pods set no node affinity; for `ReadWriteOnce` volumes on multi-node clusters, they may hang until `--timeout` if scheduled away from the node where the volume can attach.
 - Deployment replica restoration uses the replica count captured during discovery; it can fight an HPA that manages the same Deployment.
 
 ## License

@@ -105,7 +105,7 @@ want=$(seed data)
 kubectl -n $ns get pvc data-shrink-tmp >/dev/null 2>&1 && fail "dry run created a temp PVC"
 
 echo "=== full replace as root"
-"$bin" data --size 512Mi -n $ns --yes --replace-original
+"$bin" data --size 512Mi -n $ns --yes
 kubectl -n $ns rollout status deploy/app-data --timeout=180s
 [[ $(pvc_size data) == 512Mi ]] || fail "PVC was not resized, got $(pvc_size data)"
 got=$(checksum data)
@@ -115,7 +115,7 @@ kubectl -n $ns get pvc data-shrink-tmp >/dev/null 2>&1 && fail "temp PVC was not
 echo "=== full replace as non-root"
 workload data2 1000
 want=$(seed data2)
-"$bin" data2 --size 512Mi -n $ns --yes --replace-original --run-as-user 1000
+"$bin" data2 --size 512Mi -n $ns --yes --run-as-user 1000
 kubectl -n $ns rollout status deploy/app-data2 --timeout=180s
 [[ $(pvc_size data2) == 512Mi ]] || fail "PVC was not resized, got $(pvc_size data2)"
 got=$(checksum data2)

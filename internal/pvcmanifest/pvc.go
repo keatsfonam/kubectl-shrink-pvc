@@ -54,10 +54,8 @@ func Build(source *corev1.PersistentVolumeClaim, name string, target resource.Qu
 	return pvc, nil
 }
 
-func TempName(sourceName, suffix string) string {
-	if suffix == "" {
-		suffix = "shrink-tmp"
-	}
+func TempName(sourceName string) string {
+	const suffix = "shrink-tmp"
 	base := sourceName + "-" + suffix
 	if len(base) <= 63 {
 		return base

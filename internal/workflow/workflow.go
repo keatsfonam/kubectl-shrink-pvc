@@ -28,21 +28,20 @@ type Config struct {
 	Yes                 bool
 	DryRun              bool
 	KeepTemp            bool
-	ManualScale         bool
-	ReplaceOriginal     bool
+	NoScale             bool
 	TempName            string
-	TempSuffix          string
-	InspectImage        string
-	CopyImage           string
+	Image               string
 	RsyncExtraArgs      string
 	RunAsUser           int64
 	FSGroup             int64
 	SafetyMarginPercent int
-	WaitTimeout         time.Duration
-	PollInterval        time.Duration
+	Timeout             time.Duration
 	IOStreams           genericclioptions.IOStreams
 	ConfigFlags         *genericclioptions.ConfigFlags
 }
+
+// Status checks do not need to be configurable.
+const pollInterval = 2 * time.Second
 
 func Run(ctx context.Context, cfg Config) error {
 	client, namespace, err := kube.Clientset(cfg.ConfigFlags)
@@ -84,7 +83,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	if cfg.TempName == "" {
-		cfg.TempName = pvcmanifest.TempName(cfg.PVCName, cfg.TempSuffix)
+		cfg.TempName = pvcmanifest.TempName(cfg.PVCName)
 	}
 	if cfg.TempName == cfg.PVCName {
 		return fmt.Errorf("temporary PVC name must differ from source PVC name")
@@ -95,7 +94,7 @@ func Run(ctx context.Context, cfg Config) error {
 		fmt.Fprintln(cfg.IOStreams.Out, "\nDry-run only; no changes made.")
 		return nil
 	}
-	if err := validateConsumers(plan, cfg.ManualScale); err != nil {
+	if err := validateConsumers(plan, cfg.NoScale); err != nil {
 		return err
 	}
 	if !cfg.Yes {
@@ -120,7 +119,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
-	if !cfg.ManualScale && len(plan.Deployments) > 0 {
+	if !cfg.NoScale && len(plan.Deployments) > 0 {
 		fmt.Fprintln(cfg.IOStreams.Out, "Scaling Deployments to zero...")
 		if err := kube.ScaleDeployments(ctx, client, plan.Deployments, 0); err != nil {
 			return err
@@ -129,15 +128,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	fmt.Fprintln(cfg.IOStreams.Out, "Waiting for source PVC to be unmounted...")
-	if err := kube.WaitForPVCUnmounted(ctx, client, namespace, cfg.PVCName, cfg.WaitTimeout, cfg.PollInterval); err != nil {
+	if err := kube.WaitForPVCUnmounted(ctx, client, namespace, cfg.PVCName, cfg.Timeout, pollInterval); err != nil {
 		return err
 	}
 
 	fmt.Fprintln(cfg.IOStreams.Out, "Inspecting source PVC usage...")
 	usedBytes, err := inspect.UsageBytes(ctx, client, inspect.Options{
-		Namespace: namespace, PVCName: cfg.PVCName, Image: cfg.InspectImage,
+		Namespace: namespace, PVCName: cfg.PVCName, Image: cfg.Image,
 		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
-		WaitTimeout: cfg.WaitTimeout, PollInterval: cfg.PollInterval,
+		WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
 	})
 	if err != nil {
 		return err
@@ -167,18 +166,12 @@ func Run(ctx context.Context, cfg Config) error {
 	mover := datamover.RsyncMover{Client: client}
 	fmt.Fprintf(cfg.IOStreams.Out, "Copying %s -> %s...\n", cfg.PVCName, cfg.TempName)
 	if err := mover.Move(ctx, datamover.Request{
-		Namespace: namespace, SourcePVC: cfg.PVCName, DestPVC: cfg.TempName, Image: cfg.CopyImage,
+		Namespace: namespace, SourcePVC: cfg.PVCName, DestPVC: cfg.TempName, Image: cfg.Image,
 		JobName: naming.SafeDNSLabel("shrink-copy-to-temp-" + cfg.PVCName), ExtraArgs: cfg.RsyncExtraArgs,
 		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
-		WaitTimeout: cfg.WaitTimeout, PollInterval: cfg.PollInterval,
+		WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
 	}); err != nil {
 		return err
-	}
-
-	if !cfg.ReplaceOriginal {
-		fmt.Fprintf(cfg.IOStreams.Out, "\nTemp copy completed at PVC %s/%s. Original PVC was not modified.\n", namespace, cfg.TempName)
-		fmt.Fprintln(cfg.IOStreams.Out, "Rerun with --replace-original when ready to delete/recreate the original PVC and copy data back.")
-		return nil
 	}
 
 	restoreOnExit = false
@@ -186,7 +179,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, cfg.PVCName, metav1.DeleteOptions{}); err != nil {
 		return fmt.Errorf("delete original PVC: %w", err)
 	}
-	if err := kube.WaitForPVCDeleted(ctx, client, namespace, cfg.PVCName, cfg.WaitTimeout, cfg.PollInterval); err != nil {
+	if err := kube.WaitForPVCDeleted(ctx, client, namespace, cfg.PVCName, cfg.Timeout, pollInterval); err != nil {
 		return err
 	}
 
@@ -201,10 +194,10 @@ func Run(ctx context.Context, cfg Config) error {
 
 	fmt.Fprintf(cfg.IOStreams.Out, "Copying %s -> %s...\n", cfg.TempName, cfg.PVCName)
 	if err := mover.Move(ctx, datamover.Request{
-		Namespace: namespace, SourcePVC: cfg.TempName, DestPVC: cfg.PVCName, Image: cfg.CopyImage,
+		Namespace: namespace, SourcePVC: cfg.TempName, DestPVC: cfg.PVCName, Image: cfg.Image,
 		JobName: naming.SafeDNSLabel("shrink-copy-back-" + cfg.PVCName), ExtraArgs: cfg.RsyncExtraArgs,
 		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
-		WaitTimeout: cfg.WaitTimeout, PollInterval: cfg.PollInterval,
+		WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
 	}); err != nil {
 		return err
 	}
@@ -233,7 +226,7 @@ func validateConsumers(plan *kube.ConsumerPlan, manual bool) error {
 		return fmt.Errorf("unsupported PVC consumers in v1: %s", strings.Join(items, ", "))
 	}
 	if manual && len(plan.Pods) > 0 {
-		return fmt.Errorf("--manual-scale requires the PVC to already be unmounted; active pods: %v", plan.Pods)
+		return fmt.Errorf("--no-scale requires the PVC to already be unmounted; active pods: %v", plan.Pods)
 	}
 	return nil
 }
@@ -246,8 +239,7 @@ func printPlan(cfg Config, namespace string, source *corev1.PersistentVolumeClai
 	fmt.Fprintf(out, "  Current size:     %s\n", current.String())
 	fmt.Fprintf(out, "  Target size:      %s\n", target.String())
 	fmt.Fprintf(out, "  Temporary PVC:    %s/%s\n", namespace, cfg.TempName)
-	fmt.Fprintf(out, "  Replace original: %t\n", cfg.ReplaceOriginal)
-	fmt.Fprintf(out, "  Manual scale:     %t\n", cfg.ManualScale)
+	fmt.Fprintf(out, "  Scale consumers:  %t\n", !cfg.NoScale)
 	fmt.Fprintf(out, "  Safety margin:    %d%%\n", cfg.SafetyMarginPercent)
 	if len(plan.Pods) > 0 {
 		fmt.Fprintf(out, "  Active pods:      %s\n", strings.Join(plan.Pods, ", "))
