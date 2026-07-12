@@ -40,7 +40,7 @@ func TestEnsureTemporaryPVCRejectsExistingWrongSize(t *testing.T) {
 	target := resource.MustParse("2Gi")
 	tempPVC := ownedTempPVC("data-shrink", "ns", "2Gi", "source-uid", "data")
 
-	_, err := ensureTemporaryPVC(context.Background(), client, "ns", tempPVC, target)
+	_, _, err := ensureTemporaryPVC(context.Background(), client, "ns", tempPVC, target)
 	if err == nil {
 		t.Fatal("expected size mismatch error")
 	}
@@ -54,7 +54,7 @@ func TestEnsureTemporaryPVCRejectsExistingWithoutOwnership(t *testing.T) {
 	target := resource.MustParse("2Gi")
 	tempPVC := ownedTempPVC("data-shrink", "ns", "2Gi", "source-uid", "data")
 
-	_, err := ensureTemporaryPVC(context.Background(), client, "ns", tempPVC, target)
+	_, _, err := ensureTemporaryPVC(context.Background(), client, "ns", tempPVC, target)
 	if err == nil || !strings.Contains(err.Error(), "not owned by this source PVC") {
 		t.Fatalf("expected ownership error, got %v", err)
 	}
@@ -65,12 +65,15 @@ func TestEnsureTemporaryPVCReusesExistingMatchingSize(t *testing.T) {
 	target := resource.MustParse("2Gi")
 	tempPVC := ownedTempPVC("data-shrink", "ns", "2Gi", "source-uid", "data")
 
-	reused, err := ensureTemporaryPVC(context.Background(), client, "ns", tempPVC, target)
+	got, reused, err := ensureTemporaryPVC(context.Background(), client, "ns", tempPVC, target)
 	if err != nil {
 		t.Fatalf("ensureTemporaryPVC returned error: %v", err)
 	}
 	if !reused {
 		t.Fatal("expected existing matching temp PVC to be reused")
+	}
+	if got.Name != tempPVC.Name {
+		t.Fatalf("unexpected PVC returned: %s", got.Name)
 	}
 }
 

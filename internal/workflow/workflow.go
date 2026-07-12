@@ -173,7 +173,7 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	tempPVC.Annotations[tempSourceUIDAnnotation] = string(source.UID)
 	tempPVC.Annotations[tempSourceNameAnnotation] = source.Name
 	fmt.Fprintf(cfg.IOStreams.Out, "Creating temporary PVC %s/%s...\n", namespace, cfg.TempName)
-	reused, err := ensureTemporaryPVC(ctx, client, namespace, tempPVC, target)
+	tempPVC, reused, err := ensureTemporaryPVC(ctx, client, namespace, tempPVC, target)
 	if err != nil {
 		return err
 	}
@@ -193,8 +193,8 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	}
 
 	fmt.Fprintf(cfg.IOStreams.Out, "Deleting original PVC %s/%s...\n", namespace, cfg.PVCName)
-	if err := client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, cfg.PVCName, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("delete original PVC: %w", err)
+	if err := kube.DeletePVC(ctx, client, namespace, cfg.PVCName, source.UID); err != nil {
+		return err
 	}
 	if err := kube.WaitForPVCDeleted(ctx, client, namespace, cfg.PVCName, cfg.Timeout, pollInterval); err != nil {
 		return err
@@ -225,8 +225,8 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 
 	if !cfg.KeepTemp {
 		fmt.Fprintf(cfg.IOStreams.Out, "Deleting temporary PVC %s/%s...\n", namespace, cfg.TempName)
-		if err := client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, cfg.TempName, metav1.DeleteOptions{}); err != nil {
-			return fmt.Errorf("delete temp PVC: %w", err)
+		if err := kube.DeletePVC(ctx, client, namespace, cfg.TempName, tempPVC.UID); err != nil {
+			return err
 		}
 	}
 
@@ -295,24 +295,25 @@ func requiredBytesWithMargin(usedBytes int64, marginPercent int) (int64, error) 
 	return required.Int64(), nil
 }
 
-func ensureTemporaryPVC(ctx context.Context, client kubernetes.Interface, namespace string, tempPVC *corev1.PersistentVolumeClaim, target resource.Quantity) (bool, error) {
-	if _, err := client.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, tempPVC, metav1.CreateOptions{}); err != nil {
+func ensureTemporaryPVC(ctx context.Context, client kubernetes.Interface, namespace string, tempPVC *corev1.PersistentVolumeClaim, target resource.Quantity) (*corev1.PersistentVolumeClaim, bool, error) {
+	created, err := client.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, tempPVC, metav1.CreateOptions{})
+	if err != nil {
 		if !apierrors.IsAlreadyExists(err) {
-			return false, fmt.Errorf("create temp PVC: %w", err)
+			return nil, false, fmt.Errorf("create temp PVC: %w", err)
 		}
 		existing, getErr := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, tempPVC.Name, metav1.GetOptions{})
 		if getErr != nil {
-			return false, fmt.Errorf("get existing temp PVC %s/%s: %w", namespace, tempPVC.Name, getErr)
+			return nil, false, fmt.Errorf("get existing temp PVC %s/%s: %w", namespace, tempPVC.Name, getErr)
 		}
 		if existing.Annotations[tempSourceUIDAnnotation] != tempPVC.Annotations[tempSourceUIDAnnotation] ||
 			existing.Annotations[tempSourceNameAnnotation] != tempPVC.Annotations[tempSourceNameAnnotation] {
-			return false, fmt.Errorf("temporary PVC %s/%s already exists but is not owned by this source PVC; choose a different --temp-name", namespace, tempPVC.Name)
+			return nil, false, fmt.Errorf("temporary PVC %s/%s already exists but is not owned by this source PVC; choose a different --temp-name", namespace, tempPVC.Name)
 		}
 		existingSize := pvcmanifest.CurrentSize(existing)
 		if existingSize.Cmp(target) != 0 {
-			return false, fmt.Errorf("temporary PVC %s/%s already exists at size %s, but requested target is %s; delete it or pass a different --temp-name", namespace, tempPVC.Name, existingSize.String(), target.String())
+			return nil, false, fmt.Errorf("temporary PVC %s/%s already exists at size %s, but requested target is %s; delete it or pass a different --temp-name", namespace, tempPVC.Name, existingSize.String(), target.String())
 		}
-		return true, nil
+		return existing, true, nil
 	}
-	return false, nil
+	return created, false, nil
 }
