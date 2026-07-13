@@ -22,7 +22,7 @@ Initial implementation:
 Download the archive for your platform from the [releases page](https://github.com/keatsfonam/kubectl-shrink-pvc/releases), unpack it, and put `kubectl-shrink_pvc` on your `PATH`:
 
 ```sh
-version=v0.4.0
+version=v0.5.0
 tar -xzf "kubectl-shrink-pvc_${version}_darwin_arm64.tar.gz"
 install -m 0755 kubectl-shrink_pvc /usr/local/bin/kubectl-shrink_pvc
 kubectl shrink-pvc --help
@@ -37,6 +37,8 @@ install -m 0755 kubectl-shrink_pvc /usr/local/bin/kubectl-shrink_pvc
 
 The plugin is not in the Krew index yet. `.krew.yaml` at the repo root is the manifest template for that submission; release archives are built to match it.
 
+The Kubernetes identity running the plugin needs the existing PVC, Pod/log, Job, ConfigMap, Deployment/scale, and HPA permissions used by the workflow. It also needs `get`, `create`, `update`, and `delete` on namespaced `coordination.k8s.io/leases`; a per-PVC Lease serializes destructive runs and expires 30 seconds after a hard crash.
+
 ## Usage
 
 Plan only:
@@ -47,7 +49,7 @@ kubectl shrink-pvc data --size 20Gi -n app --dry-run
 
 Real run: prints the same plan, asks for confirmation, then scales Deployment(s) down, inspects the source PVC, copies the data through a temporary smaller PVC, recreates the original at the new size, copies the data back, and restores the Deployment replicas.
 
-Before starting, suspend anything that can recreate or rescale consumers or rewrite the PVC: HorizontalPodAutoscalers, GitOps reconcilers, operators, scheduled jobs, and backup/restore automation. Record their prior state so you can restore it after the shrink. Do not run concurrent shrink operations against the same PVC or against PVCs mounted by the same Deployment; consumer scaling and recovery state are coordinated per operation, not globally.
+Before starting, suspend anything that can recreate or rescale consumers or rewrite the PVC: HorizontalPodAutoscalers, GitOps reconcilers, operators, scheduled jobs, and backup/restore automation. Record their prior state so you can restore it after the shrink. Same-PVC operations are serialized by a Lease, but do not overlap operations against different PVCs mounted by the same Deployment; consumer scaling is not coordinated across PVCs.
 
 ```sh
 kubectl shrink-pvc data --size 20Gi -n app
@@ -59,7 +61,7 @@ Useful flags:
 
 - `--keep-temp`: keep the temporary PVC after a successful shrink.
 - `--no-scale`: do not scale Deployments; require the PVC to already be unmounted.
-- `--resume`: continue a persisted replacement after an interruption; use the same `--size`, image, UID, and rsync settings as the original run.
+- `--resume`: continue a persisted replacement after an interruption; use the same `--size`, image, UID, and rsync settings as the original run. It cannot be combined with `--dry-run` because resume is mutating.
 - `--temp-name`: choose the temporary PVC name.
 - `--image`: image for the inspection pod and rsync copy jobs; needs `rsync`, `du`, and `/bin/sh`. Default: `instrumentisto/rsync-ssh:alpine3.23-r3@sha256:6cbad37c2fbdca4ac7ad9d1c1bb8990af9efd4dc76321b349935876cbb1e9e4a`.
 - `--safety-margin`: require this additional percentage of measured source usage to fit in the target PVC before copying. Default: `10`.
@@ -73,10 +75,10 @@ Useful flags:
 The tool runs in phases:
 
 1. Validate the source PVC and target size.
-2. Discover pods mounting the PVC.
-3. Refuse unsupported consumers such as StatefulSets in v1.
+2. Discover live pods and built-in controller templates that reference the PVC.
+3. Refuse unsupported consumers such as StatefulSets, DaemonSets, Jobs, CronJobs, and standalone ReplicaSets in v1.
 4. Print the plan and wait for confirmation unless `--yes` is set.
-5. Scale Deployment consumers to zero unless `--no-scale` is set.
+5. Acquire a renewable per-PVC Lease and scale Deployment consumers to zero unless `--no-scale` is set.
 6. Wait until the PVC is unmounted.
 7. Run an inspection pod that mounts the source PVC read-only and measures usage with `du`.
 8. Create a temporary PVC at the target size.
@@ -97,7 +99,7 @@ After the source-to-temporary copy succeeds, the plugin persists a ConfigMap nam
 kubectl shrink-pvc data --size 20Gi -n app --resume
 ```
 
-Resume validates PVC UIDs and operation annotations before adopting or deleting anything. An unrelated same-name PVC is never deleted. Keep the state ConfigMap and temporary PVC until recovery completes; successful completion removes the state automatically. Use `--keep-temp` for cautious runs until you are comfortable with the workflow.
+Resume validates PVC and Deployment UIDs plus operation annotations before adopting, scaling, or deleting anything. An unrelated same-name object is never mutated. Keep the state ConfigMap and temporary PVC until recovery completes; successful completion removes the state automatically. A hard-killed process can leave its Lease until the 30-second timeout expires, so wait and retry if resume reports that the lock is still held. Use `--keep-temp` for cautious runs until you are comfortable with the workflow.
 
 While recovery state exists, leave Deployment consumers suspended and do not manually create a same-name source or temporary PVC. Inspect `<pvc>-shrink-state`, confirm the temporary PVC still exists, then resume with exactly the original size, image, UID, and rsync options. If resume refuses an ownership or UID check, stop and investigate rather than deleting the conflicting object. After success, confirm the Deployment replica counts and data, then re-enable GitOps, autoscaling, operators, jobs, and backup automation in a controlled order. A resumed operation is mutating; `--dry-run` is not a preview mode for a matching `--resume` operation.
 
@@ -108,7 +110,7 @@ Each release publishes `checksums.txt`, a keyless Sigstore bundle for it, and Gi
 ```sh
 sha256sum --check --ignore-missing checksums.txt
 cosign verify-blob --bundle checksums.txt.bundle checksums.txt
-gh attestation verify kubectl-shrink-pvc_v0.4.0_linux_amd64.tar.gz \
+gh attestation verify kubectl-shrink-pvc_v0.5.0_linux_amd64.tar.gz \
   --repo keatsfonam/kubectl-shrink-pvc
 ```
 
@@ -124,8 +126,8 @@ Use `shasum -a 256 -c checksums.txt` instead of `sha256sum` on macOS. Verificati
 - Namespaces that enforce the `restricted` PodSecurity profile reject the default root inspect/copy pods; use `--run-as-user` there and accept that file ownership is not preserved.
 - Inspect and rsync pods set no node affinity; for `ReadWriteOnce` volumes on multi-node clusters, they may hang until `--timeout` if scheduled away from the node where the volume can attach.
 - HorizontalPodAutoscalers targeting a Deployment consumer must be suspended before the workflow starts; the plugin refuses to continue while one is active. Other reconcilers and operators are not detected and must be suspended manually.
-- Concurrent operations are not coordinated across PVCs. Never overlap operations that share a Deployment consumer, and allow only one operation per PVC.
-- Consumer ownership, replica counts, and the source PVC UID are revalidated after confirmation and immediately before deletion.
+- Same-PVC operations are serialized with a renewable Lease, but operations are not coordinated across PVCs. Never overlap operations that share a Deployment consumer.
+- Built-in controller templates, consumer ownership, replica counts, and the source PVC UID are revalidated around destructive and copy-back boundaries. Custom controllers and CRDs cannot be discovered generically and must be suspended manually.
 
 ## License
 

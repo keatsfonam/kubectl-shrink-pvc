@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -90,7 +92,7 @@ func DiscoverConsumers(ctx context.Context, client kubernetes.Interface, namespa
 		return nil, fmt.Errorf("list StatefulSets: %w", err)
 	}
 	for i := range statefulSets.Items {
-		if templateUsesPVC(&statefulSets.Items[i].Spec.Template.Spec, pvcName) {
+		if statefulSetUsesPVC(&statefulSets.Items[i], pvcName) {
 			addUnsupported("StatefulSet", statefulSets.Items[i].Name, "")
 		}
 	}
@@ -203,6 +205,24 @@ func ActivePodsUsingPVC(ctx context.Context, client kubernetes.Interface, namesp
 }
 
 func podUsesPVC(pod *corev1.Pod, pvcName string) bool { return templateUsesPVC(&pod.Spec, pvcName) }
+
+func statefulSetUsesPVC(statefulSet *appsv1.StatefulSet, pvcName string) bool {
+	if templateUsesPVC(&statefulSet.Spec.Template.Spec, pvcName) {
+		return true
+	}
+	for i := range statefulSet.Spec.VolumeClaimTemplates {
+		prefix := statefulSet.Spec.VolumeClaimTemplates[i].Name + "-" + statefulSet.Name + "-"
+		if !strings.HasPrefix(pvcName, prefix) {
+			continue
+		}
+		ordinal, err := strconv.Atoi(strings.TrimPrefix(pvcName, prefix))
+		if err == nil && ordinal >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func templateUsesPVC(spec *corev1.PodSpec, pvcName string) bool {
 	for _, vol := range spec.Volumes {
 		if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == pvcName {

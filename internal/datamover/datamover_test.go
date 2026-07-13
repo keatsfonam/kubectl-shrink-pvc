@@ -76,6 +76,14 @@ func TestVerificationDifferencesNoChanges(t *testing.T) {
 	}
 }
 
+func TestVerificationDifferencesIgnoresUnchangedRecords(t *testing.T) {
+	logs := verificationRecordPrefix + ".f          files/unchanged\n" + verificationRecordPrefix + ".d          files/dir\ntotal size is 42  speedup is 1.00 (DRY RUN)\n"
+	got, err := verificationDifferences(logs)
+	if err != nil || got != "" {
+		t.Fatalf("verificationDifferences() = %q, %v", got, err)
+	}
+}
+
 func TestVerificationDifferencesReportsChanges(t *testing.T) {
 	logs := verificationRecordPrefix + ">fc........ files/changed\n" + verificationRecordPrefix + "*deleting   files/extra\ntotal size is 42  speedup is 1.00 (DRY RUN)\n"
 	want := ">fc........ files/changed\n*deleting   files/extra"

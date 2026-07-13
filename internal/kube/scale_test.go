@@ -27,6 +27,30 @@ func TestRestoreDeploymentsRefusesSameNameReplacement(t *testing.T) {
 	}
 }
 
+func TestScaleDeploymentRefusesReplacementBetweenObjectAndScaleReads(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	updated := false
+	client.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		get := action.(clienttesting.GetAction)
+		if action.GetSubresource() == "" {
+			return true, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: get.GetNamespace(), UID: "old-uid", ResourceVersion: "10"}}, nil
+		}
+		return true, &autoscalingv1.Scale{ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: get.GetNamespace(), UID: "new-uid", ResourceVersion: "11"}}, nil
+	})
+	client.PrependReactor("update", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		updated = true
+		return true, action.(clienttesting.UpdateAction).GetObject(), nil
+	})
+
+	err := RestoreDeployments(context.Background(), client, []DeploymentRef{{Namespace: "ns", Name: "web", UID: "old-uid", Replicas: 3}})
+	if err == nil || !strings.Contains(err.Error(), "was replaced while reading its scale") {
+		t.Fatalf("expected replacement refusal, got %v", err)
+	}
+	if updated {
+		t.Fatal("replacement Deployment was scaled")
+	}
+}
+
 func TestWaitForPVCDeletedPropagatesAPIErrors(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	client.PrependReactor("get", "persistentvolumeclaims", func(clienttesting.Action) (bool, runtime.Object, error) {

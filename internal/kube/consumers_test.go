@@ -63,6 +63,25 @@ func TestDiscoverConsumersFindsControllerTemplatesWithoutPods(t *testing.T) {
 	}
 }
 
+func TestDiscoverConsumersFindsScaledDownStatefulSetClaimTemplate(t *testing.T) {
+	replicas := int32(0)
+	client := fake.NewSimpleClientset(&appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "ns"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:             &replicas,
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "data"}}},
+		},
+	})
+
+	plan, err := DiscoverConsumers(context.Background(), client, "ns", "data-db-0")
+	if err != nil {
+		t.Fatalf("DiscoverConsumers returned error: %v", err)
+	}
+	if len(plan.Unsupported) != 1 || plan.Unsupported[0].Kind != "StatefulSet" || plan.Unsupported[0].Name != "db" {
+		t.Fatalf("expected scaled-down StatefulSet consumer, got %#v", plan.Unsupported)
+	}
+}
+
 func TestDiscoverConsumersFlagsStatefulSet(t *testing.T) {
 	controller := true
 	client := fake.NewSimpleClientset(pod("db-0", "ns", "data", []metav1.OwnerReference{{Kind: "StatefulSet", Name: "db", Controller: &controller}}))

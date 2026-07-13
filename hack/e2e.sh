@@ -199,15 +199,28 @@ kubectl -n "$ns" wait --for=delete pvc/interrupted --timeout=120s
 
 state_rv=$(kubectl -n "$ns" get configmap interrupted-shrink-state -o jsonpath='{.metadata.resourceVersion}')
 temp_uid=$(kubectl -n "$ns" get pvc interrupted-shrink-tmp -o jsonpath='{.metadata.uid}')
-if out=$("$bin" interrupted --size 512Mi -n "$ns" --dry-run --resume --image "$E2E_ALPINE_IMAGE" 2>&1); then
-	fail "expected mismatched dry-run resume to be rejected"
+if out=$("$bin" interrupted --size 512Mi -n "$ns" --dry-run --resume 2>&1); then
+	fail "expected dry-run resume to be rejected"
 fi
-echo "$out" | grep -q 'must match the persisted operation' || fail "unexpected dry-run resume rejection: $out"
+echo "$out" | grep -q -- '--dry-run cannot be combined with --resume' || fail "unexpected dry-run resume rejection: $out"
 [[ $(kubectl -n "$ns" get configmap interrupted-shrink-state -o jsonpath='{.metadata.resourceVersion}') == "$state_rv" ]] || fail "rejected dry-run resume mutated recovery state"
 [[ $(kubectl -n "$ns" get pvc interrupted-shrink-tmp -o jsonpath='{.metadata.uid}') == "$temp_uid" ]] || fail "rejected dry-run resume replaced recovery PVC"
 kubectl -n "$ns" get pvc interrupted >/dev/null 2>&1 && fail "rejected dry-run resume recreated source PVC"
 
-"$bin" interrupted --size 512Mi -n "$ns" --resume
+# A hard-killed process cannot release its Lease. Retry until the 30-second
+# Lease expires, then require the first acquired resume to complete fully.
+resumed=false
+for _ in {1..45}; do
+	if out=$("$bin" interrupted --size 512Mi -n "$ns" --resume 2>&1); then
+		resumed=true
+		break
+	fi
+	if ! echo "$out" | grep -q 'operation lock .* is held'; then
+		fail "resume failed after interruption: $out"
+	fi
+	sleep 1
+done
+[[ $resumed == true ]] || fail "resume never acquired the expired operation Lease"
 kubectl -n "$ns" rollout status deploy/app-interrupted --timeout=180s
 [[ $(pvc_size interrupted) == 512Mi ]] || fail "resumed PVC has wrong size"
 resume_got=$(checksum interrupted)

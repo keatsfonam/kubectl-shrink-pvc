@@ -170,7 +170,7 @@ func verificationDifferences(logs string) (string, error) {
 		line = strings.TrimRight(line, "\r")
 		if strings.HasPrefix(line, verificationRecordPrefix) {
 			record := strings.TrimPrefix(line, verificationRecordPrefix)
-			if record != "" {
+			if record != "" && !isUnchangedVerificationRecord(record) {
 				differences = append(differences, record)
 			}
 			continue
@@ -183,6 +183,21 @@ func verificationDifferences(logs string) (string, error) {
 		return "", fmt.Errorf("completion sentinel not found")
 	}
 	return strings.Join(differences, "\n"), nil
+}
+
+func isUnchangedVerificationRecord(record string) bool {
+	// The itemized code is 11 bytes. A leading '.', followed by the file type
+	// and nine spaces, describes an unchanged entry that some rsync versions
+	// still emit with --itemize-changes.
+	if len(record) < 11 || record[0] != '.' {
+		return false
+	}
+	for i := 2; i < 11; i++ {
+		if record[i] != ' ' {
+			return false
+		}
+	}
+	return true
 }
 
 func isVerificationSentinel(line string) bool {
