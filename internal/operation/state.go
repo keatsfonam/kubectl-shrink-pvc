@@ -27,10 +27,11 @@ const (
 type Phase string
 
 const (
-	PhaseCopiedToTemp    Phase = "CopiedToTemp"
-	PhaseSourceDeleted   Phase = "SourceDeleted"
-	PhaseSourceRecreated Phase = "SourceRecreated"
-	PhaseCopiedBack      Phase = "CopiedBack"
+	PhaseCopiedToTemp         Phase = "CopiedToTemp"
+	PhaseSourceDeleteAccepted Phase = "SourceDeleteAccepted"
+	PhaseSourceDeleted        Phase = "SourceDeleted"
+	PhaseSourceRecreated      Phase = "SourceRecreated"
+	PhaseCopiedBack           Phase = "CopiedBack"
 )
 
 type State struct {
@@ -105,6 +106,17 @@ func (s Store) Create(ctx context.Context, state *State) (*corev1.ConfigMap, err
 	return cm, nil
 }
 
+func (s Store) EnsureAbsent(ctx context.Context) error {
+	_, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(ctx, s.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check for existing operation state %s/%s: %w", s.Namespace, s.Name, err)
+	}
+	return fmt.Errorf("operation state %s/%s already exists; rerun with --resume", s.Namespace, s.Name)
+}
+
 func (s Store) Load(ctx context.Context) (*State, *corev1.ConfigMap, error) {
 	cm, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(ctx, s.Name, metav1.GetOptions{})
 	if err != nil {
@@ -125,10 +137,19 @@ func (s Store) Update(ctx context.Context, state *State, resourceVersion string)
 	if err != nil {
 		return "", err
 	}
-	cm, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Update(ctx, &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: s.Name, Namespace: s.Namespace, ResourceVersion: resourceVersion},
-		Data:       map[string]string{stateKey: string(data)},
-	}, metav1.UpdateOptions{})
+	current, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(ctx, s.Name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get operation state before update: %w", err)
+	}
+	if resourceVersion != "" && current.ResourceVersion != resourceVersion {
+		return "", fmt.Errorf("update operation state to %s: resource version changed", state.Phase)
+	}
+	cm := current.DeepCopy()
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	cm.Data[stateKey] = string(data)
+	cm, err = s.Client.CoreV1().ConfigMaps(s.Namespace).Update(ctx, cm, metav1.UpdateOptions{})
 	if err != nil {
 		return "", fmt.Errorf("update operation state to %s: %w", state.Phase, err)
 	}

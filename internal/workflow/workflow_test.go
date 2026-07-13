@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -14,6 +15,22 @@ import (
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/kube"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/operation"
 )
+
+func TestRunRejectsDryRunResumeBeforeClusterAccess(t *testing.T) {
+	err := Run(context.Background(), Config{DryRun: true, Resume: true})
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunRejectsNonPositiveTargetBeforeClusterAccess(t *testing.T) {
+	for _, size := range []string{"0", "-1Gi"} {
+		err := Run(context.Background(), Config{TargetSize: size, Timeout: time.Second, RunAsUser: -1})
+		if err == nil || !strings.Contains(err.Error(), "must be positive") {
+			t.Errorf("size %s: unexpected error %v", size, err)
+		}
+	}
+}
 
 func TestValidateDestructiveBoundaryRejectsReplacement(t *testing.T) {
 	client := fake.NewSimpleClientset(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "ns", UID: "replacement"}})
@@ -74,6 +91,51 @@ func TestResumeRequiresRecoveryPVCBeforeDeletingSource(t *testing.T) {
 	got, getErr := client.CoreV1().PersistentVolumeClaims("ns").Get(context.Background(), "data", metav1.GetOptions{})
 	if getErr != nil || got.UID != "original" {
 		t.Fatalf("original source was changed: pvc=%#v err=%v", got, getErr)
+	}
+}
+
+func TestResumeDeleteAcceptedRequiresRecoveryPVCBeforeRecreate(t *testing.T) {
+	finalPVC := pvc("data", "ns", "1Gi")
+	operation.StampRecreatedPVC(finalPVC, "op")
+	finalJSON, err := json.Marshal(finalPVC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := fake.NewSimpleClientset()
+	store := operation.Store{Client: client, Namespace: "ns", Name: operation.NameForPVC("data")}
+	state := &operation.State{
+		Version: 1, OperationID: "op", Namespace: "ns", SourceName: "data",
+		OriginalSourceUID: "original", TempName: "missing-temp", TempUID: "temp-uid",
+		TargetSize: "1Gi", Image: "image", RunAsUser: -1, FSGroup: -1,
+		FinalPVCJSON: finalJSON, Phase: operation.PhaseSourceDeleteAccepted,
+	}
+	if _, err := store.Create(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+
+	err = resume(context.Background(), Config{PVCName: "data", Image: "image", RunAsUser: -1, FSGroup: -1, Timeout: time.Second}, client, "ns", resource.MustParse("1Gi"))
+	if err == nil || !strings.Contains(err.Error(), "temporary recovery PVC") {
+		t.Fatalf("expected missing recovery PVC error, got %v", err)
+	}
+	if _, getErr := client.CoreV1().PersistentVolumeClaims("ns").Get(context.Background(), "data", metav1.GetOptions{}); getErr == nil {
+		t.Fatal("source PVC was recreated without recovery data")
+	}
+}
+
+func TestResumeRejectsChangedFSGroup(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	store := operation.Store{Client: client, Namespace: "ns", Name: operation.NameForPVC("data")}
+	state := &operation.State{
+		Version: 1, OperationID: "op", Namespace: "ns", SourceName: "data",
+		TargetSize: "1Gi", Image: "image", RunAsUser: 1000, FSGroup: 2000,
+		Phase: operation.PhaseCopiedToTemp,
+	}
+	if _, err := store.Create(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+	err := resume(context.Background(), Config{PVCName: "data", Image: "image", RunAsUser: 1000, FSGroup: 3000}, client, "ns", resource.MustParse("1Gi"))
+	if err == nil || !strings.Contains(err.Error(), "run-as settings") {
+		t.Fatalf("expected security context mismatch, got %v", err)
 	}
 }
 

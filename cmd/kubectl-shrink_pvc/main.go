@@ -44,6 +44,12 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          cobra.ExactArgs(1),
+		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			if cfg.DryRun && cfg.Resume {
+				return fmt.Errorf("--dry-run cannot be combined with --resume")
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg.PVCName = args[0]
 			return workflow.Run(cmd.Context(), cfg)

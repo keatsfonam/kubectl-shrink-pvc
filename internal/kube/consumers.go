@@ -8,13 +8,15 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
 type DeploymentRef struct {
-	Namespace string
-	Name      string
-	Replicas  int32
+	Namespace string    `json:"namespace"`
+	Name      string    `json:"name"`
+	UID       types.UID `json:"uid"`
+	Replicas  int32     `json:"replicas"`
 }
 
 type UnsupportedConsumer struct {
@@ -44,6 +46,12 @@ func DiscoverConsumers(ctx context.Context, client kubernetes.Interface, namespa
 	plan := &ConsumerPlan{}
 	deployments := map[string]DeploymentRef{}
 	unsupported := map[string]UnsupportedConsumer{}
+	addUnsupported := func(kind, name, pod string) {
+		key := kind + "/" + name
+		if _, exists := unsupported[key]; !exists {
+			unsupported[key] = UnsupportedConsumer{Kind: kind, Name: name, Pod: pod}
+		}
+	}
 
 	for i := range pods.Items {
 		pod := pods.Items[i]
@@ -51,17 +59,79 @@ func DiscoverConsumers(ctx context.Context, client kubernetes.Interface, namespa
 			continue
 		}
 		plan.Pods = append(plan.Pods, pod.Name)
-
 		dep, unsup, err := resolvePodOwner(ctx, client, namespace, &pod)
 		if err != nil {
 			return nil, err
 		}
 		if dep != nil {
 			deployments[dep.Namespace+"/"+dep.Name] = *dep
+		} else if unsup != nil {
+			addUnsupported(unsup.Kind, unsup.Name, unsup.Pod)
+		}
+	}
+
+	deps, err := client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list Deployments: %w", err)
+	}
+	for i := range deps.Items {
+		dep := &deps.Items[i]
+		if templateUsesPVC(&dep.Spec.Template.Spec, pvcName) {
+			replicas := int32(1)
+			if dep.Spec.Replicas != nil {
+				replicas = *dep.Spec.Replicas
+			}
+			deployments[namespace+"/"+dep.Name] = DeploymentRef{Namespace: namespace, Name: dep.Name, UID: dep.UID, Replicas: replicas}
+		}
+	}
+
+	statefulSets, err := client.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list StatefulSets: %w", err)
+	}
+	for i := range statefulSets.Items {
+		if templateUsesPVC(&statefulSets.Items[i].Spec.Template.Spec, pvcName) {
+			addUnsupported("StatefulSet", statefulSets.Items[i].Name, "")
+		}
+	}
+	daemonSets, err := client.AppsV1().DaemonSets(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list DaemonSets: %w", err)
+	}
+	for i := range daemonSets.Items {
+		if templateUsesPVC(&daemonSets.Items[i].Spec.Template.Spec, pvcName) {
+			addUnsupported("DaemonSet", daemonSets.Items[i].Name, "")
+		}
+	}
+	replicaSets, err := client.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list ReplicaSets: %w", err)
+	}
+	for i := range replicaSets.Items {
+		rs := &replicaSets.Items[i]
+		if owner := controllerOwner(rs.OwnerReferences); owner != nil && owner.Kind == "Deployment" {
 			continue
 		}
-		if unsup != nil {
-			unsupported[unsup.Kind+"/"+unsup.Name+"/"+unsup.Pod] = *unsup
+		if templateUsesPVC(&rs.Spec.Template.Spec, pvcName) {
+			addUnsupported("ReplicaSet", rs.Name, "")
+		}
+	}
+	jobs, err := client.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list Jobs: %w", err)
+	}
+	for i := range jobs.Items {
+		if templateUsesPVC(&jobs.Items[i].Spec.Template.Spec, pvcName) {
+			addUnsupported("Job", jobs.Items[i].Name, "")
+		}
+	}
+	cronJobs, err := client.BatchV1().CronJobs(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list CronJobs: %w", err)
+	}
+	for i := range cronJobs.Items {
+		if templateUsesPVC(&cronJobs.Items[i].Spec.JobTemplate.Spec.Template.Spec, pvcName) {
+			addUnsupported("CronJob", cronJobs.Items[i].Name, "")
 		}
 	}
 
@@ -71,7 +141,6 @@ func DiscoverConsumers(ctx context.Context, client kubernetes.Interface, namespa
 	for _, item := range unsupported {
 		plan.Unsupported = append(plan.Unsupported, item)
 	}
-
 	sort.Strings(plan.Pods)
 	sort.Slice(plan.Deployments, func(i, j int) bool { return plan.Deployments[i].Name < plan.Deployments[j].Name })
 	sort.Slice(plan.Unsupported, func(i, j int) bool {
@@ -80,7 +149,6 @@ func DiscoverConsumers(ctx context.Context, client kubernetes.Interface, namespa
 		}
 		return plan.Unsupported[i].Kind < plan.Unsupported[j].Kind
 	})
-
 	return plan, nil
 }
 
@@ -92,7 +160,6 @@ func DiscoverDeploymentHPAs(ctx context.Context, client kubernetes.Interface, de
 		}
 		targetsByNamespace[dep.Namespace][dep.Name] = struct{}{}
 	}
-
 	var refs []HPARef
 	for namespace, targets := range targetsByNamespace {
 		hpas, err := client.AutoscalingV2().HorizontalPodAutoscalers(namespace).List(ctx, metav1.ListOptions{})
@@ -124,7 +191,6 @@ func ActivePodsUsingPVC(ctx context.Context, client kubernetes.Interface, namesp
 	if err != nil {
 		return nil, fmt.Errorf("list pods: %w", err)
 	}
-
 	var names []string
 	for i := range pods.Items {
 		pod := pods.Items[i]
@@ -136,15 +202,15 @@ func ActivePodsUsingPVC(ctx context.Context, client kubernetes.Interface, namesp
 	return names, nil
 }
 
-func podUsesPVC(pod *corev1.Pod, pvcName string) bool {
-	for _, vol := range pod.Spec.Volumes {
+func podUsesPVC(pod *corev1.Pod, pvcName string) bool { return templateUsesPVC(&pod.Spec, pvcName) }
+func templateUsesPVC(spec *corev1.PodSpec, pvcName string) bool {
+	for _, vol := range spec.Volumes {
 		if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == pvcName {
 			return true
 		}
 	}
 	return false
 }
-
 func isTerminalPod(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 }
@@ -153,12 +219,10 @@ func resolvePodOwner(ctx context.Context, client kubernetes.Interface, namespace
 	if len(pod.OwnerReferences) == 0 {
 		return nil, &UnsupportedConsumer{Kind: "Pod", Name: pod.Name, Pod: pod.Name}, nil
 	}
-
 	owner := controllerOwner(pod.OwnerReferences)
 	if owner == nil {
 		owner = &pod.OwnerReferences[0]
 	}
-
 	switch owner.Kind {
 	case "ReplicaSet":
 		rs, err := client.AppsV1().ReplicaSets(namespace).Get(ctx, owner.Name, metav1.GetOptions{})
@@ -175,7 +239,7 @@ func resolvePodOwner(ctx context.Context, client kubernetes.Interface, namespace
 			if dep.Spec.Replicas != nil {
 				replicas = *dep.Spec.Replicas
 			}
-			return &DeploymentRef{Namespace: namespace, Name: dep.Name, Replicas: replicas}, nil, nil
+			return &DeploymentRef{Namespace: namespace, Name: dep.Name, UID: dep.UID, Replicas: replicas}, nil, nil
 		}
 		return nil, &UnsupportedConsumer{Kind: "ReplicaSet", Name: owner.Name, Pod: pod.Name}, nil
 	case "Deployment":
@@ -187,9 +251,7 @@ func resolvePodOwner(ctx context.Context, client kubernetes.Interface, namespace
 		if dep.Spec.Replicas != nil {
 			replicas = *dep.Spec.Replicas
 		}
-		return &DeploymentRef{Namespace: namespace, Name: dep.Name, Replicas: replicas}, nil, nil
-	case "StatefulSet":
-		return nil, &UnsupportedConsumer{Kind: "StatefulSet", Name: owner.Name, Pod: pod.Name}, nil
+		return &DeploymentRef{Namespace: namespace, Name: dep.Name, UID: dep.UID, Replicas: replicas}, nil, nil
 	default:
 		return nil, &UnsupportedConsumer{Kind: owner.Kind, Name: owner.Name, Pod: pod.Name}, nil
 	}
@@ -205,5 +267,5 @@ func controllerOwner(owners []metav1.OwnerReference) *metav1.OwnerReference {
 }
 
 func DeploymentObject(ref DeploymentRef) *appsv1.Deployment {
-	return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace, Name: ref.Name}}
+	return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace, Name: ref.Name, UID: ref.UID}}
 }

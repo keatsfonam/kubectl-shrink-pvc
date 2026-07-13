@@ -30,6 +30,50 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreUpdatePreservesConfigMapMetadata(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	store := Store{Client: client, Namespace: "ns", Name: NameForPVC("data")}
+	state := &State{Version: 1, OperationID: "op", Namespace: "ns", SourceName: "data", Phase: PhaseCopiedToTemp}
+	cm, err := store.Create(context.Background(), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm.Labels["custom"] = "keep"
+	cm.Annotations = map[string]string{"custom": "keep"}
+	cm.Data["custom"] = "keep"
+	cm.Finalizers = []string{"example.test/finalizer"}
+	cm, err = client.CoreV1().ConfigMaps("ns").Update(context.Background(), cm, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Phase = PhaseSourceDeleted
+	if _, err := store.Update(context.Background(), state, cm.ResourceVersion); err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.CoreV1().ConfigMaps("ns").Get(context.Background(), store.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Labels["custom"] != "keep" || got.Annotations["custom"] != "keep" || len(got.Finalizers) != 1 {
+		t.Fatalf("metadata was not preserved: %#v", got.ObjectMeta)
+	}
+	if got.Data["custom"] != "keep" {
+		t.Fatalf("unrelated ConfigMap data was not preserved: %#v", got.Data)
+	}
+}
+
+func TestStoreEnsureAbsentRejectsExistingOperation(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: NameForPVC("data"), Namespace: "ns"}})
+	store := Store{Client: client, Namespace: "ns", Name: NameForPVC("data")}
+	if err := store.EnsureAbsent(context.Background()); err == nil {
+		t.Fatal("expected existing operation error")
+	}
+	missing := Store{Client: client, Namespace: "ns", Name: NameForPVC("other")}
+	if err := missing.EnsureAbsent(context.Background()); err != nil {
+		t.Fatalf("unexpected missing-state error: %v", err)
+	}
+}
+
 func TestStoreRejectsExistingOperation(t *testing.T) {
 	client := fake.NewSimpleClientset(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: NameForPVC("data"), Namespace: "ns"}})
 	store := Store{Client: client, Namespace: "ns", Name: NameForPVC("data")}

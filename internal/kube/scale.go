@@ -36,6 +36,13 @@ func ScaleDeployments(ctx context.Context, client kubernetes.Interface, deps []D
 }
 
 func scaleDeployment(ctx context.Context, client kubernetes.Interface, dep DeploymentRef, replicas int32) (bool, error) {
+	current, err := client.AppsV1().Deployments(dep.Namespace).Get(ctx, dep.Name, metav1.GetOptions{})
+	if err != nil {
+		return false, fmt.Errorf("get Deployment %s/%s: %w", dep.Namespace, dep.Name, err)
+	}
+	if dep.UID == "" || current.UID != dep.UID {
+		return false, fmt.Errorf("Deployment %s/%s was replaced; refusing to scale it", dep.Namespace, dep.Name)
+	}
 	scale, err := client.AppsV1().Deployments(dep.Namespace).GetScale(ctx, dep.Name, metav1.GetOptions{})
 	if err != nil {
 		return false, fmt.Errorf("get scale for Deployment %s/%s: %w", dep.Namespace, dep.Name, err)

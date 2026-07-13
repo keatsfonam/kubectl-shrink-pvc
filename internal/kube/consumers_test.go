@@ -6,6 +6,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -30,6 +31,35 @@ func TestDiscoverConsumersResolvesDeployment(t *testing.T) {
 	}
 	if len(plan.Unsupported) != 0 {
 		t.Fatalf("unexpected unsupported consumers: %#v", plan.Unsupported)
+	}
+}
+
+func TestDiscoverConsumersFindsControllerTemplatesWithoutPods(t *testing.T) {
+	replicas := int32(0)
+	template := func() corev1.PodTemplateSpec { return corev1.PodTemplateSpec{Spec: pod("", "", "data", nil).Spec} }
+	client := fake.NewSimpleClientset(
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "ns", UID: "web-uid"}, Spec: appsv1.DeploymentSpec{Replicas: &replicas, Template: template()}},
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "ns"}, Spec: appsv1.StatefulSetSpec{Template: template()}},
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "ns"}, Spec: appsv1.DaemonSetSpec{Template: template()}},
+		&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "standalone", Namespace: "ns"}, Spec: appsv1.ReplicaSetSpec{Template: template()}},
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns"}, Spec: batchv1.JobSpec{Template: template()}},
+		&batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: "cron", Namespace: "ns"}, Spec: batchv1.CronJobSpec{JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{Template: template()}}}},
+	)
+	plan, err := DiscoverConsumers(context.Background(), client, "ns", "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Pods) != 0 || len(plan.Deployments) != 1 || plan.Deployments[0].UID != "web-uid" {
+		t.Fatalf("unexpected supported consumers: %#v", plan)
+	}
+	got := map[string]bool{}
+	for _, item := range plan.Unsupported {
+		got[item.Kind+"/"+item.Name] = true
+	}
+	for _, want := range []string{"StatefulSet/db", "DaemonSet/agent", "ReplicaSet/standalone", "Job/job", "CronJob/cron"} {
+		if !got[want] {
+			t.Errorf("missing template consumer %s in %#v", want, plan.Unsupported)
+		}
 	}
 }
 

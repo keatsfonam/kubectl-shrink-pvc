@@ -9,13 +9,23 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 )
+
+func TestRestoreDeploymentsRefusesSameNameReplacement(t *testing.T) {
+	client := fake.NewSimpleClientset(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "ns", UID: "new-uid"}})
+	err := RestoreDeployments(context.Background(), client, []DeploymentRef{{Namespace: "ns", Name: "web", UID: "old-uid", Replicas: 3}})
+	if err == nil || !strings.Contains(err.Error(), "was replaced") {
+		t.Fatalf("expected replacement refusal, got %v", err)
+	}
+}
 
 func TestWaitForPVCDeletedPropagatesAPIErrors(t *testing.T) {
 	client := fake.NewSimpleClientset()
@@ -42,6 +52,9 @@ func TestRestoreDeploymentsAttemptsEveryDeployment(t *testing.T) {
 	var updates []string
 	client.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
 		get := action.(clienttesting.GetAction)
+		if action.GetSubresource() == "" {
+			return true, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: get.GetNamespace(), UID: types.UID("uid-" + get.GetName())}}, nil
+		}
 		return true, &autoscalingv1.Scale{ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: get.GetNamespace()}}, nil
 	})
 	client.PrependReactor("update", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
@@ -54,8 +67,8 @@ func TestRestoreDeploymentsAttemptsEveryDeployment(t *testing.T) {
 	})
 
 	err := RestoreDeployments(context.Background(), client, []DeploymentRef{
-		{Namespace: "ns", Name: "first", Replicas: 3},
-		{Namespace: "ns", Name: "second", Replicas: 2},
+		{Namespace: "ns", Name: "first", UID: "uid-first", Replicas: 3},
+		{Namespace: "ns", Name: "second", UID: "uid-second", Replicas: 2},
 	})
 	if err == nil || !strings.Contains(err.Error(), "first restore failed") {
 		t.Fatalf("expected restore error, got %v", err)
@@ -79,6 +92,9 @@ func TestScaleDeploymentsDoesNotRestoreUnreadDeployment(t *testing.T) {
 	var updates []string
 	client.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
 		get := action.(clienttesting.GetAction)
+		if action.GetSubresource() == "" {
+			return true, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: get.GetNamespace(), UID: types.UID("uid-" + get.GetName())}}, nil
+		}
 		if get.GetName() == "second" {
 			return true, nil, errors.New("get scale failed")
 		}
@@ -91,8 +107,8 @@ func TestScaleDeploymentsDoesNotRestoreUnreadDeployment(t *testing.T) {
 	})
 
 	err := ScaleDeployments(context.Background(), client, []DeploymentRef{
-		{Namespace: "ns", Name: "first", Replicas: 3},
-		{Namespace: "ns", Name: "second", Replicas: 2},
+		{Namespace: "ns", Name: "first", UID: "uid-first", Replicas: 3},
+		{Namespace: "ns", Name: "second", UID: "uid-second", Replicas: 2},
 	}, 0)
 	if err == nil || !strings.Contains(err.Error(), "get scale failed") {
 		t.Fatalf("expected get error, got %v", err)
@@ -110,6 +126,9 @@ func TestScaleDeploymentsRollsBackPartialFailure(t *testing.T) {
 
 	client.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
 		get := action.(clienttesting.GetAction)
+		if action.GetSubresource() == "" {
+			return true, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: get.GetNamespace(), UID: types.UID("uid-" + get.GetName())}}, nil
+		}
 		return true, &autoscalingv1.Scale{
 			ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: get.GetNamespace()},
 			Spec:       autoscalingv1.ScaleSpec{Replicas: replicas[get.GetName()]},
@@ -129,8 +148,8 @@ func TestScaleDeploymentsRollsBackPartialFailure(t *testing.T) {
 	})
 
 	err := ScaleDeployments(context.Background(), client, []DeploymentRef{
-		{Namespace: "ns", Name: "first", Replicas: 3},
-		{Namespace: "ns", Name: "second", Replicas: 2},
+		{Namespace: "ns", Name: "first", UID: "uid-first", Replicas: 3},
+		{Namespace: "ns", Name: "second", UID: "uid-second", Replicas: 2},
 	}, 0)
 	if err == nil {
 		t.Fatal("expected scale failure")

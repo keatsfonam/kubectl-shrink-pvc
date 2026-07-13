@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -18,7 +19,7 @@ import (
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/operation"
 )
 
-func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namespace string, requestedTarget resource.Quantity) error {
+func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namespace string, requestedTarget resource.Quantity) (retErr error) {
 	store := operation.Store{Client: client, Namespace: namespace, Name: operation.NameForPVC(cfg.PVCName)}
 	state, stateCM, err := store.Load(ctx)
 	if err != nil {
@@ -34,7 +35,7 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 	if cfg.TempName != "" && cfg.TempName != state.TempName {
 		return fmt.Errorf("--temp-name must match persisted operation value %s", state.TempName)
 	}
-	if cfg.Image != state.Image || !slices.Equal(cfg.RsyncArgs, state.RsyncArgs) || cfg.RunAsUser != state.RunAsUser {
+	if cfg.Image != state.Image || !slices.Equal(cfg.RsyncArgs, state.RsyncArgs) || cfg.RunAsUser != state.RunAsUser || cfg.FSGroup != state.FSGroup {
 		return fmt.Errorf("image, rsync arguments, and run-as settings must match the persisted operation")
 	}
 
@@ -58,6 +59,18 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		return updateErr
 	}
 	mover := datamover.RsyncMover{Client: client}
+	scaled := false
+	restoreOnExit := true
+	defer func() {
+		if !scaled || !restoreOnExit {
+			return
+		}
+		restoreCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+		defer cancel()
+		if err := kube.RestoreDeployments(restoreCtx, client, state.Deployments); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("restore Deployment replicas while resuming: %w", err))
+		}
+	}()
 
 	if state.Phase == operation.PhaseCopiedToTemp {
 		// Recovery data must be present and owned before touching an intact source.
@@ -68,20 +81,43 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		switch {
 		case apierrors.IsNotFound(getErr):
 			// The process may have exited after deletion but before checkpointing.
+			restoreOnExit = false
+			if err := updatePhase(operation.PhaseSourceDeleted); err != nil {
+				return err
+			}
 		case getErr != nil:
 			return fmt.Errorf("inspect source PVC while resuming: %w", getErr)
 		case source.UID != state.OriginalSourceUID:
 			return fmt.Errorf("source PVC %s/%s was replaced by an unowned object; refusing to resume", namespace, state.SourceName)
 		default:
+			if !state.NoScale && len(state.Deployments) > 0 {
+				scaled = true // ensure a final restoration attempt after any partial scale failure
+				if err := kube.ScaleDeployments(ctx, client, state.Deployments, 0); err != nil {
+					return err
+				}
+			}
+			if err := kube.WaitForPVCUnmounted(ctx, client, namespace, state.SourceName, cfg.Timeout, pollInterval); err != nil {
+				return err
+			}
 			if err := validateDestructiveBoundary(ctx, client, namespace, state.SourceName, state.OriginalSourceUID, state.Deployments, state.NoScale); err != nil {
 				return err
 			}
 			if err := kube.DeletePVC(ctx, client, namespace, state.SourceName, state.OriginalSourceUID); err != nil {
 				return err
 			}
-			if err := kube.WaitForPVCDeleted(ctx, client, namespace, state.SourceName, state.OriginalSourceUID, cfg.Timeout, pollInterval); err != nil {
+			restoreOnExit = false
+			if err := updatePhase(operation.PhaseSourceDeleteAccepted); err != nil {
 				return err
 			}
+		}
+	}
+
+	if state.Phase == operation.PhaseSourceDeleteAccepted {
+		if _, err := loadOwnedTempPVC(ctx, client, state); err != nil {
+			return err
+		}
+		if err := kube.WaitForPVCDeleted(ctx, client, namespace, state.SourceName, state.OriginalSourceUID, cfg.Timeout, pollInterval); err != nil {
+			return err
 		}
 		if err := updatePhase(operation.PhaseSourceDeleted); err != nil {
 			return err
@@ -89,6 +125,12 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 	}
 
 	if state.Phase == operation.PhaseSourceDeleted {
+		if _, err := loadOwnedTempPVC(ctx, client, state); err != nil {
+			return err
+		}
+		if err := validateWorkloadsQuiesced(ctx, client, namespace, state.SourceName, state.Deployments, state.NoScale); err != nil {
+			return fmt.Errorf("revalidate workloads before recreating source: %w", err)
+		}
 		recreated, getErr := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, state.SourceName, metav1.GetOptions{})
 		if apierrors.IsNotFound(getErr) {
 			recreated, err = client.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, &finalPVC, metav1.CreateOptions{})
@@ -107,6 +149,9 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 	}
 
 	if state.Phase == operation.PhaseSourceRecreated {
+		if err := validateWorkloadsQuiesced(ctx, client, namespace, state.SourceName, state.Deployments, state.NoScale); err != nil {
+			return fmt.Errorf("revalidate workloads before copy-back: %w", err)
+		}
 		if _, err := loadOwnedTempPVC(ctx, client, state); err != nil {
 			return err
 		}
@@ -145,12 +190,17 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		return err
 	}
 	if len(state.Deployments) > 0 && !state.NoScale {
+		// A failed restore may have updated only some Deployments. Keep the deferred
+		// final attempt armed until the full set is restored successfully.
+		restoreOnExit = true
+		scaled = true
 		restoreCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 		err := kube.RestoreDeployments(restoreCtx, client, state.Deployments)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("restore Deployment replicas while resuming: %w", err)
 		}
+		scaled = false
 	}
 	if !state.KeepTemp {
 		if err := kube.DeletePVC(ctx, client, namespace, state.TempName, state.TempUID); err != nil {

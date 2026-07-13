@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRootCommandExposesSafeRecoveryFlags(t *testing.T) {
 	cmd := newRootCmd()
@@ -14,6 +17,14 @@ func TestRootCommandExposesSafeRecoveryFlags(t *testing.T) {
 	}
 	if flag := cmd.Flags().Lookup("rsync-extra-args"); flag.Deprecated == "" {
 		t.Fatal("--rsync-extra-args must be marked deprecated")
+	}
+}
+
+func TestRootCommandRejectsDryRunResume(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"data", "--size=1Gi", "--dry-run", "--resume"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("expected incompatible flag error, got %v", err)
 	}
 }
 
