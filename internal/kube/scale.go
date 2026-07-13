@@ -16,10 +16,13 @@ import (
 func ScaleDeployments(ctx context.Context, client kubernetes.Interface, deps []DeploymentRef, replicas int32) error {
 	scaled := make([]DeploymentRef, 0, len(deps))
 	for _, dep := range deps {
-		// Record the attempt before the API call. An UpdateScale may succeed on
-		// the server even when the client receives a timeout or connection error.
-		scaled = append(scaled, dep)
-		if err := scaleDeployment(ctx, client, dep, replicas); err != nil {
+		attempted, err := scaleDeployment(ctx, client, dep, replicas)
+		if attempted {
+			// UpdateScale may succeed on the server even when the client receives
+			// a timeout or connection error, so every attempted write is restored.
+			scaled = append(scaled, dep)
+		}
+		if err != nil {
 			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			rollbackErr := restoreDeploymentSet(rollbackCtx, client, scaled)
@@ -32,22 +35,22 @@ func ScaleDeployments(ctx context.Context, client kubernetes.Interface, deps []D
 	return nil
 }
 
-func scaleDeployment(ctx context.Context, client kubernetes.Interface, dep DeploymentRef, replicas int32) error {
+func scaleDeployment(ctx context.Context, client kubernetes.Interface, dep DeploymentRef, replicas int32) (bool, error) {
 	scale, err := client.AppsV1().Deployments(dep.Namespace).GetScale(ctx, dep.Name, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("get scale for Deployment %s/%s: %w", dep.Namespace, dep.Name, err)
+		return false, fmt.Errorf("get scale for Deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
 	scale.Spec.Replicas = replicas
 	if _, err := client.AppsV1().Deployments(dep.Namespace).UpdateScale(ctx, dep.Name, scale, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("scale Deployment %s/%s to %d: %w", dep.Namespace, dep.Name, replicas, err)
+		return true, fmt.Errorf("scale Deployment %s/%s to %d: %w", dep.Namespace, dep.Name, replicas, err)
 	}
-	return nil
+	return true, nil
 }
 
 func restoreDeploymentSet(ctx context.Context, client kubernetes.Interface, deps []DeploymentRef) error {
 	var errs []error
 	for _, dep := range deps {
-		if err := scaleDeployment(ctx, client, dep, dep.Replicas); err != nil {
+		if _, err := scaleDeployment(ctx, client, dep, dep.Replicas); err != nil {
 			errs = append(errs, err)
 		}
 	}

@@ -74,6 +74,35 @@ func TestWaitForPVCDeletedRejectsReplacement(t *testing.T) {
 	}
 }
 
+func TestScaleDeploymentsDoesNotRestoreUnreadDeployment(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	var updates []string
+	client.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		get := action.(clienttesting.GetAction)
+		if get.GetName() == "second" {
+			return true, nil, errors.New("get scale failed")
+		}
+		return true, &autoscalingv1.Scale{ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: get.GetNamespace()}, Spec: autoscalingv1.ScaleSpec{Replicas: 3}}, nil
+	})
+	client.PrependReactor("update", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		scale := action.(clienttesting.UpdateAction).GetObject().(*autoscalingv1.Scale)
+		updates = append(updates, fmt.Sprintf("%s=%d", scale.Name, scale.Spec.Replicas))
+		return true, scale, nil
+	})
+
+	err := ScaleDeployments(context.Background(), client, []DeploymentRef{
+		{Namespace: "ns", Name: "first", Replicas: 3},
+		{Namespace: "ns", Name: "second", Replicas: 2},
+	}, 0)
+	if err == nil || !strings.Contains(err.Error(), "get scale failed") {
+		t.Fatalf("expected get error, got %v", err)
+	}
+	want := []string{"first=0", "first=3"}
+	if !reflect.DeepEqual(updates, want) {
+		t.Fatalf("unexpected updates: got %v, want %v", updates, want)
+	}
+}
+
 func TestScaleDeploymentsRollsBackPartialFailure(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	replicas := map[string]int32{"first": 3, "second": 2}
