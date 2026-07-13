@@ -12,7 +12,7 @@ func TestSafeDNSLabel(t *testing.T) {
 		in   string
 		want string
 	}{
-		{name: "lowercases and replaces separators", in: "Data_Volume.Backup", want: "data-volume-backup"},
+		{name: "lowercases and replaces separators", in: "Data_Volume.Backup", want: "data-volume-backup-bcd02e4984"},
 		{name: "trims dashes", in: "-Data-", want: "data"},
 		{name: "hashes long names", in: long, want: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-6bd5e50348"},
 		{name: "hashes rather than trimming at a dash", in: strings.Repeat("a", 62) + "-suffix", want: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-23fd32c7b9"},
@@ -23,6 +23,17 @@ func TestSafeDNSLabel(t *testing.T) {
 				t.Fatalf("SafeDNSLabel(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSafeDNSLabelNormalizationDoesNotCollide(t *testing.T) {
+	withDot := SafeDNSLabel("data.backup")
+	withDash := SafeDNSLabel("data-backup")
+	if withDot == withDash {
+		t.Fatalf("normalized generated names collided: %q", withDot)
+	}
+	if got := LegacySafeDNSLabel("data.backup"); got != withDash {
+		t.Fatalf("legacy normalization changed: got %q, want %q", got, withDash)
 	}
 }
 

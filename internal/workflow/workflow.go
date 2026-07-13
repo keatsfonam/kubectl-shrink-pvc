@@ -275,10 +275,10 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		}
 		// Checkpoint and disarm restoration before the ambiguous Delete call: the
 		// API server can accept deletion even when the client receives an error.
-		restoreOnExit = false
 		if err := updatePhase(operation.PhaseSourceDeleteRequested); err != nil {
 			return err
 		}
+		restoreOnExit = false
 		fmt.Fprintf(cfg.IOStreams.Out, "Deleting original PVC %s/%s...\n", namespace, cfg.PVCName)
 		if err := kube.DeletePVC(ctx, client, namespace, cfg.PVCName, source.UID); err != nil {
 			return err
