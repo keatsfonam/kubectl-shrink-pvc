@@ -56,6 +56,21 @@ func TestVerificationJobMountsBothPVCsReadOnly(t *testing.T) {
 	}
 }
 
+func TestVerificationDifferencesIgnoresUnchangedEntries(t *testing.T) {
+	logs := ".f          files/blob1\n.d          files\n"
+	if got := verificationDifferences(logs); got != "" {
+		t.Fatalf("unchanged entries reported as differences: %q", got)
+	}
+}
+
+func TestVerificationDifferencesReportsChanges(t *testing.T) {
+	logs := ".f          files/unchanged\n>fc........ files/changed\n*deleting   files/extra\n"
+	want := ">fc........ files/changed\n*deleting   files/extra"
+	if got := verificationDifferences(logs); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestVerifyArgs(t *testing.T) {
 	got := verifyArgs([]string{"--exclude=cache", "--bwlimit=10m"}, false)
 	if got[len(got)-2] != "/src/" || got[len(got)-1] != "/dest/" {

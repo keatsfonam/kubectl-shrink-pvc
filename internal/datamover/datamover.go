@@ -129,10 +129,37 @@ func (m RsyncMover) Verify(ctx context.Context, req Request) error {
 		return err
 	}
 	cleaned = true
-	if differences := strings.TrimSpace(logs); differences != "" {
+	if differences := verificationDifferences(logs); differences != "" {
 		return fmt.Errorf("copy verification found differences:\n%s", differences)
 	}
 	return nil
+}
+
+func verificationDifferences(logs string) string {
+	var differences []string
+	for _, line := range strings.Split(logs, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		// Rsync can emit unchanged entries such as ".f          path" when
+		// checksum/itemize mode is active. The itemized code is 11 bytes: a
+		// leading '.', a file-type byte, and nine unchanged attribute slots.
+		if len(line) >= 11 && line[0] == '.' {
+			unchanged := true
+			for i := 2; i < 11; i++ {
+				if line[i] != ' ' {
+					unchanged = false
+					break
+				}
+			}
+			if unchanged {
+				continue
+			}
+		}
+		differences = append(differences, line)
+	}
+	return strings.Join(differences, "\n")
 }
 
 func verifyArgs(copyArgs []string, nonRoot bool) []string {
