@@ -91,7 +91,9 @@ func TestScaleDeploymentsRollsBackPartialFailure(t *testing.T) {
 		scale := update.GetObject().(*autoscalingv1.Scale)
 		updates = append(updates, scale.Name+"="+fmt.Sprint(scale.Spec.Replicas))
 		if scale.Name == "second" && scale.Spec.Replicas == 0 {
-			return true, nil, errors.New("scale API failed")
+			// Simulate a server-side write followed by an ambiguous transport error.
+			replicas[scale.Name] = scale.Spec.Replicas
+			return true, nil, errors.New("scale response lost")
 		}
 		replicas[scale.Name] = scale.Spec.Replicas
 		return true, scale, nil
@@ -104,10 +106,10 @@ func TestScaleDeploymentsRollsBackPartialFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected scale failure")
 	}
-	if replicas["first"] != 3 {
-		t.Fatalf("first Deployment was not restored: replicas=%d", replicas["first"])
+	if replicas["first"] != 3 || replicas["second"] != 2 {
+		t.Fatalf("Deployments were not restored: %#v", replicas)
 	}
-	wantUpdates := []string{"first=0", "second=0", "first=3"}
+	wantUpdates := []string{"first=0", "second=0", "first=3", "second=2"}
 	if !reflect.DeepEqual(updates, wantUpdates) {
 		t.Fatalf("unexpected updates: got %v, want %v", updates, wantUpdates)
 	}

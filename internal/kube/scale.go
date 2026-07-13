@@ -16,14 +16,18 @@ import (
 func ScaleDeployments(ctx context.Context, client kubernetes.Interface, deps []DeploymentRef, replicas int32) error {
 	scaled := make([]DeploymentRef, 0, len(deps))
 	for _, dep := range deps {
+		// Record the attempt before the API call. An UpdateScale may succeed on
+		// the server even when the client receives a timeout or connection error.
+		scaled = append(scaled, dep)
 		if err := scaleDeployment(ctx, client, dep, replicas); err != nil {
-			rollbackErr := restoreDeploymentSet(ctx, client, scaled)
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			rollbackErr := restoreDeploymentSet(rollbackCtx, client, scaled)
 			if rollbackErr != nil {
 				return errors.Join(err, fmt.Errorf("roll back partially scaled Deployments: %w", rollbackErr))
 			}
 			return err
 		}
-		scaled = append(scaled, dep)
 	}
 	return nil
 }
