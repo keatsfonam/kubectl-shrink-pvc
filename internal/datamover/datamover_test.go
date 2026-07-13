@@ -97,6 +97,9 @@ func TestVerificationDifferencesRequiresCompletionSentinel(t *testing.T) {
 	if got, err := verificationDifferences(verificationRecordPrefix + ">fc........ files/changed\n"); err == nil || got != "" {
 		t.Fatalf("verificationDifferences() = %q, %v; want missing-sentinel error", got, err)
 	}
+	if !isVerificationSentinel("total size is 25,174,016  speedup is 123,456.78 (DRY RUN)") {
+		t.Fatal("rejected valid C-locale sentinel with grouped numbers")
+	}
 	for _, invalid := range []string{"total size is forged", "total size is 1 speedup is nope", "not total size is 1 speedup is 1"} {
 		if isVerificationSentinel(invalid) {
 			t.Fatalf("accepted invalid sentinel %q", invalid)

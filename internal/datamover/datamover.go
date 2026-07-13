@@ -209,7 +209,7 @@ func isVerificationSentinel(line string) bool {
 		return false
 	}
 	_, sizeErr := strconv.ParseUint(strings.ReplaceAll(parts[0], ",", ""), 10, 64)
-	_, speedErr := strconv.ParseFloat(strings.TrimSuffix(parts[3], " (DRY RUN)"), 64)
+	_, speedErr := strconv.ParseFloat(strings.ReplaceAll(parts[3], ",", ""), 64)
 	return sizeErr == nil && speedErr == nil
 }
 
