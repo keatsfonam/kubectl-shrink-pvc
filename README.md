@@ -17,6 +17,8 @@ Initial implementation:
 - Source usage inspection is included before copying
 - Prints the full plan and asks for confirmation before changing anything
 
+See [live progress behavior](docs/progress.md) for the portable signals, output contract, and percentage limitations of this replacement workflow.
+
 ## Install
 
 Download the archive for your platform from the [releases page](https://github.com/keatsfonam/kubectl-shrink-pvc/releases), unpack it, and put `kubectl-shrink_pvc` on your `PATH`:
@@ -49,7 +51,7 @@ Plan only:
 kubectl shrink-pvc data --size 20Gi -n app --dry-run
 ```
 
-Real run: prints the same plan, asks for confirmation, then scales Deployment(s) down, inspects the source PVC, copies the data through a temporary smaller PVC, recreates the original at the new size, copies the data back, and restores the Deployment replicas.
+Real run: prints the same plan, asks for confirmation, then shows live phase, elapsed-time, and activity snapshots while it scales Deployment(s) down, inspects the source PVC, copies the data through a temporary smaller PVC, recreates the original at the new size, copies the data back, and restores the Deployment replicas.
 
 Before starting, suspend anything that can recreate or rescale consumers or rewrite the PVC: HorizontalPodAutoscalers, GitOps reconcilers, operators, scheduled jobs, and backup/restore automation. Record their prior state so you can restore it after the shrink. Same-PVC operations are serialized by a Lease, but do not overlap operations against different PVCs mounted by the same Deployment; consumer scaling is not coordinated across PVCs.
 
@@ -57,13 +59,14 @@ Before starting, suspend anything that can recreate or rescale consumers or rewr
 kubectl shrink-pvc data --size 20Gi -n app
 ```
 
-Pass `--yes` to skip the confirmation prompt, and `--keep-temp` to keep the intermediate copy around as a fallback.
+Pass `--yes` to skip the confirmation prompt, `--keep-temp` to keep the intermediate copy around as a fallback, and `--quiet` to suppress only live progress and activity output.
 
 Useful flags:
 
 - `--keep-temp`: keep the temporary PVC after a successful shrink.
 - `--no-scale`: do not scale Deployments; require the PVC to already be unmounted.
 - `--resume`: continue a persisted replacement after an interruption; use the same `--size`, image, UID, and rsync settings as the original run. It cannot be combined with `--dry-run` because resume is mutating.
+- `--quiet`: suppress stage, phase, heartbeat, activity, cleanup, and streamed rsync progress for this invocation. It does not imply `--yes`, suppress warnings or errors, or become part of persisted recovery state. It works with normal, `--dry-run`, and `--resume` invocations.
 - `--temp-name`: choose the temporary PVC name.
 - `--image`: image for the inspection pod and rsync copy jobs; needs `rsync`, `du`, and `/bin/sh`. Default: `instrumentisto/rsync-ssh:alpine3.23-r3@sha256:6cbad37c2fbdca4ac7ad9d1c1bb8990af9efd4dc76321b349935876cbb1e9e4a`.
 - `--safety-margin`: require this additional percentage of measured source usage to fit in the target PVC before copying. Default: `10`.
@@ -71,6 +74,16 @@ Useful flags:
 - `--run-as-user`: run the inspect and copy pods as this non-root UID so they satisfy the `restricted` PodSecurity profile. Copied files become owned by this UID with umask-derived modes, so it suits volumes owned by a single application user. Without it, pods run as root with a hardened context (seccomp `RuntimeDefault`, no privilege escalation, all capabilities dropped except the handful rsync and du need) and preserve ownership and modes exactly.
 - `--fs-group`: `fsGroup` for the inspect and copy pods. Defaults to the `--run-as-user` UID.
 - `--timeout`: timeout for pods, jobs, PVC deletion, and workload scaling. Default: `10m`.
+
+## Live progress and quiet output
+
+By default, every progress snapshot names the current display phase, total elapsed time since this command invocation, elapsed time in that display phase, and the latest available Kubernetes or rsync activity. Elapsed time uses a monotonic clock. A resumed command starts a fresh total timer; recovery state does not contain or reconstruct elapsed history.
+
+When stdout is a TTY, progress is safely cleared and redrawn on one bounded line. When stdout is redirected or piped, progress is emitted as bounded, complete, newline-delimited snapshots with no carriage-return or ANSI redraw sequences. Durable output is kept separate from redraws: the execution plan, confirmation prompt unless `--yes` is set, source-usage summary, dry-run result, final success or recovery result, help, and version output remain ordinary human-readable text.
+
+The two copies are reported independently as `copy 1 of 2: source to temporary` and `copy 2 of 2: temporary to source`. If the selected rsync image emits a percentage, it is labeled **per-copy** and reset for copy-back. Kubernetes and CSI expose no portable overall byte percentage, stage weighting, or ETA for provisioning, mounting, two copies, two checksum passes, replacement, restoration, and cleanup, so the plugin does not claim one. A failed or unavailable live log stream falls back to Job and Pod lifecycle activity; Job conditions and the existing post-failure diagnostic log path remain authoritative.
+
+`--quiet` suppresses only progress, heartbeat, activity, cleanup, and streamed rsync snapshots. It still prints the plan, prompt, source-usage summary, dry-run result, and final success or recovery result when those outputs apply. Warnings and errors remain on stderr unchanged, Kubernetes operations and exit statuses are unchanged, and confirmation is still required unless `--yes` is supplied.
 
 ## Safety model
 

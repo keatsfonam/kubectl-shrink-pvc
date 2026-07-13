@@ -6,6 +6,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/naming"
@@ -24,9 +25,29 @@ const DefaultImage = "instrumentisto/rsync-ssh:alpine3.23-r3@sha256:6cbad37c2fbd
 
 const (
 	maxJobLogBytes             = 1 << 20
+	maxLiveLogRecordBytes      = 16 << 10
 	verificationRecordPrefix   = "KSP_VERIFY_RECORD "
 	verificationSentinelPrefix = "total size is "
 )
+
+type Observation struct {
+	JobName       string
+	JobCondition  string
+	JobMessage    string
+	Active        int32
+	Succeeded     int32
+	Failed        int32
+	PodName       string
+	PodPhase      corev1.PodPhase
+	WaitingReason string
+	PodCount      int
+	Cleanup       bool
+	LogRecord     string
+	FinalRecord   bool
+	StreamError   string
+}
+
+type Observer func(Observation)
 
 type Request struct {
 	Namespace    string
@@ -39,11 +60,13 @@ type Request struct {
 	FSGroup      int64
 	WaitTimeout  time.Duration
 	PollInterval time.Duration
+	Observe      Observer
 }
 
 type RsyncMover struct {
-	Client   kubernetes.Interface
-	readLogs podLogReader
+	Client     kubernetes.Interface
+	readLogs   podLogReader
+	streamLogs podLogReader
 }
 
 type podLogReader func(context.Context, string, string, *corev1.PodLogOptions) (io.ReadCloser, error)
@@ -59,21 +82,33 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 	if _, err := m.Client.BatchV1().Jobs(req.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create rsync job: %w", err)
 	}
+	notifyObserver(req.Observe, Observation{JobName: runName})
 
-	if err := waitForJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval); err != nil {
+	liveLogs := newCopyLogStream(ctx, m.Client, m.streamLogs, req.Namespace, runName, req.Observe)
+	observePod := func(observation Observation) {
+		notifyObserver(req.Observe, observation)
+		if observation.PodName != "" {
+			liveLogs.Start(observation.PodName)
+		}
+	}
+	podObserver := startJobPodObserver(ctx, m.Client, req.Namespace, runName, req.PollInterval, observePod)
+	waitErr := waitForJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval, req.Observe)
+	podObserver.Stop()
+	liveLogs.Stop()
+	if waitErr != nil {
 		// Fetch logs and clean up on a fresh context so a cancelled caller
 		// (Ctrl-C) does not leave the failed job behind, but bound it so a
 		// broken API server cannot hang the exit path.
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), req.WaitTimeout)
 		defer cancel()
 		logs, _ := jobLogs(cleanupCtx, m.Client, m.readLogs, req.Namespace, runName)
-		_ = cleanupJob(cleanupCtx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval)
+		_ = cleanupJob(cleanupCtx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval, req.Observe)
 		if logs != "" {
-			return fmt.Errorf("%w; logs: %s", err, logs)
+			return fmt.Errorf("%w; logs: %s", waitErr, logs)
 		}
-		return err
+		return waitErr
 	}
-	if err := cleanupJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval); err != nil {
+	if err := cleanupJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval, req.Observe); err != nil {
 		return err
 	}
 	return nil
@@ -120,6 +155,8 @@ func (m RsyncMover) Verify(ctx context.Context, req Request) error {
 	if _, err := m.Client.BatchV1().Jobs(req.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create rsync verification job: %w", err)
 	}
+	notifyObserver(req.Observe, Observation{JobName: runName})
+	podObserver := startJobPodObserver(ctx, m.Client, req.Namespace, runName, req.PollInterval, req.Observe)
 	cleaned := false
 	defer func() {
 		if cleaned {
@@ -127,25 +164,27 @@ func (m RsyncMover) Verify(ctx context.Context, req Request) error {
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), req.WaitTimeout)
 		defer cancel()
-		_ = cleanupJob(cleanupCtx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval)
+		_ = cleanupJob(cleanupCtx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval, req.Observe)
 	}()
-	if err := waitForJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval); err != nil {
+	waitErr := waitForJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval, req.Observe)
+	podObserver.Stop()
+	if waitErr != nil {
 		failureCtx, cancel := context.WithTimeout(context.Background(), req.WaitTimeout)
 		defer cancel()
 		logs, logErr := jobLogs(failureCtx, m.Client, m.readLogs, req.Namespace, runName)
 		if logErr == nil && logs != "" {
-			return fmt.Errorf("verify copied data: %w; logs: %s", err, logs)
+			return fmt.Errorf("verify copied data: %w; logs: %s", waitErr, logs)
 		}
 		if logErr != nil {
-			return fmt.Errorf("verify copied data: %w; read verification logs: %v", err, logErr)
+			return fmt.Errorf("verify copied data: %w; read verification logs: %v", waitErr, logErr)
 		}
-		return fmt.Errorf("verify copied data: %w", err)
+		return fmt.Errorf("verify copied data: %w", waitErr)
 	}
 	logs, err := jobLogs(ctx, m.Client, m.readLogs, req.Namespace, runName)
 	if err != nil {
 		return fmt.Errorf("read verification logs: %w", err)
 	}
-	if err := cleanupJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval); err != nil {
+	if err := cleanupJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval, req.Observe); err != nil {
 		return err
 	}
 	cleaned = true
@@ -265,7 +304,7 @@ func uniqueName(base string) string {
 	return base + suffix
 }
 
-func cleanupJob(ctx context.Context, client kubernetes.Interface, namespace, name string, timeout, poll time.Duration) error {
+func cleanupJob(ctx context.Context, client kubernetes.Interface, namespace, name string, timeout, poll time.Duration, observers ...Observer) error {
 	selector := "shrink-pvc-job=" + name
 	if err := client.BatchV1().Jobs(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete rsync job: %w", err)
@@ -278,6 +317,7 @@ func cleanupJob(ctx context.Context, client kubernetes.Interface, namespace, nam
 		if err != nil {
 			return false, fmt.Errorf("list rsync job pods during cleanup: %w", err)
 		}
+		notifyObservers(observers, Observation{JobName: name, PodCount: len(pods.Items), Cleanup: true})
 		return len(pods.Items) == 0, nil
 	})
 	if wait.Interrupted(err) && ctx.Err() == nil {
@@ -286,26 +326,299 @@ func cleanupJob(ctx context.Context, client kubernetes.Interface, namespace, nam
 	return err
 }
 
-func waitForJob(ctx context.Context, client kubernetes.Interface, namespace, name string, timeout, poll time.Duration) error {
+func waitForJob(ctx context.Context, client kubernetes.Interface, namespace, name string, timeout, poll time.Duration, observers ...Observer) error {
 	err := wait.PollUntilContextTimeout(ctx, poll, timeout, true, func(ctx context.Context) (bool, error) {
 		job, err := client.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return false, fmt.Errorf("get rsync job: %w", err)
 		}
+		observation := Observation{JobName: name, Active: job.Status.Active, Succeeded: job.Status.Succeeded, Failed: job.Status.Failed}
 		for _, cond := range job.Status.Conditions {
-			if cond.Type == batchv1.JobComplete && cond.Status == corev1.ConditionTrue {
+			if cond.Status != corev1.ConditionTrue {
+				continue
+			}
+			observation.JobCondition = string(cond.Type)
+			observation.JobMessage = cond.Message
+			notifyObservers(observers, observation)
+			if cond.Type == batchv1.JobComplete {
 				return true, nil
 			}
-			if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+			if cond.Type == batchv1.JobFailed {
 				return false, fmt.Errorf("rsync job failed: %s", cond.Message)
 			}
 		}
+		notifyObservers(observers, observation)
 		return false, nil
 	})
 	if wait.Interrupted(err) && ctx.Err() == nil {
 		return fmt.Errorf("timed out waiting for rsync job %s/%s", namespace, name)
 	}
 	return err
+}
+
+type jobPodObserver struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	once   sync.Once
+}
+
+func startJobPodObserver(ctx context.Context, client kubernetes.Interface, namespace, jobName string, poll time.Duration, observer Observer) *jobPodObserver {
+	observationCtx, cancel := context.WithCancel(ctx)
+	result := &jobPodObserver{cancel: cancel, done: make(chan struct{})}
+	if observer == nil {
+		close(result.done)
+		return result
+	}
+	if poll <= 0 {
+		poll = time.Second
+	}
+	go func() {
+		defer close(result.done)
+		observe := func() {
+			pods, err := client.CoreV1().Pods(namespace).List(observationCtx, metav1.ListOptions{LabelSelector: "shrink-pvc-job=" + jobName})
+			if err != nil {
+				return
+			}
+			if len(pods.Items) == 0 {
+				notifyObserver(observer, Observation{JobName: jobName})
+				return
+			}
+			for i := range pods.Items {
+				pod := &pods.Items[i]
+				notifyObserver(observer, Observation{
+					JobName: jobName, PodName: pod.Name, PodPhase: pod.Status.Phase,
+					WaitingReason: podWaitingReason(pod), PodCount: len(pods.Items),
+				})
+			}
+		}
+		observe()
+		ticker := time.NewTicker(poll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-observationCtx.Done():
+				return
+			case <-ticker.C:
+				observe()
+			}
+		}
+	}()
+	return result
+}
+
+func (o *jobPodObserver) Stop() {
+	o.once.Do(func() {
+		o.cancel()
+		<-o.done
+	})
+}
+
+type copyLogStream struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	client    kubernetes.Interface
+	reader    podLogReader
+	namespace string
+	jobName   string
+	observer  Observer
+
+	mu        sync.Mutex
+	running   bool
+	completed bool
+	stopped   bool
+	stream    *onceReadCloser
+	wg        sync.WaitGroup
+}
+
+func newCopyLogStream(ctx context.Context, client kubernetes.Interface, reader podLogReader, namespace, jobName string, observer Observer) *copyLogStream {
+	streamCtx, cancel := context.WithCancel(ctx)
+	return &copyLogStream{ctx: streamCtx, cancel: cancel, client: client, reader: reader, namespace: namespace, jobName: jobName, observer: observer}
+}
+
+func (s *copyLogStream) Start(podName string) {
+	s.mu.Lock()
+	if s.running || s.completed || s.stopped || s.observer == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.running = true
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go s.run(podName)
+}
+
+func (s *copyLogStream) Stop() {
+	s.mu.Lock()
+	if !s.stopped {
+		s.stopped = true
+		s.cancel()
+	}
+	stream := s.stream
+	s.mu.Unlock()
+	if stream != nil {
+		_ = stream.Close()
+	}
+	s.wg.Wait()
+}
+
+func (s *copyLogStream) run(podName string) {
+	successfullyOpened := false
+	var stream *onceReadCloser
+	defer func() {
+		s.mu.Lock()
+		s.running = false
+		if successfullyOpened {
+			s.completed = true
+		}
+		if s.stream == stream {
+			s.stream = nil
+		}
+		s.mu.Unlock()
+		s.wg.Done()
+	}()
+	reader := s.reader
+	if reader == nil {
+		reader = func(ctx context.Context, namespace, pod string, options *corev1.PodLogOptions) (io.ReadCloser, error) {
+			return s.client.CoreV1().Pods(namespace).GetLogs(pod, options).Stream(ctx)
+		}
+	}
+	opened, err := reader(s.ctx, s.namespace, podName, &corev1.PodLogOptions{Container: "rsync", Follow: true})
+	if err != nil {
+		if s.ctx.Err() == nil {
+			notifyObserver(s.observer, Observation{JobName: s.jobName, PodName: podName, StreamError: err.Error()})
+		}
+		return
+	}
+	stream = &onceReadCloser{ReadCloser: opened}
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		_ = stream.Close()
+		return
+	}
+	s.stream = stream
+	successfullyOpened = true
+	s.mu.Unlock()
+
+	parser := &logRecordParser{}
+	buffer := make([]byte, 32<<10)
+	lastRecord := ""
+	emit := func(record string, final bool) {
+		if record == "" {
+			return
+		}
+		lastRecord = record
+		notifyObserver(s.observer, Observation{JobName: s.jobName, PodName: podName, LogRecord: record, FinalRecord: final})
+	}
+	for {
+		n, readErr := stream.Read(buffer)
+		if n > 0 {
+			parser.Write(buffer[:n], func(record string) { emit(record, false) })
+		}
+		if readErr == nil {
+			continue
+		}
+		emittedPartial := false
+		parser.Flush(func(record string) {
+			emittedPartial = true
+			emit(record, true)
+		})
+		if !emittedPartial && lastRecord != "" {
+			emit(lastRecord, true)
+		}
+		if readErr != io.EOF && s.ctx.Err() == nil {
+			notifyObserver(s.observer, Observation{JobName: s.jobName, PodName: podName, StreamError: readErr.Error()})
+		}
+		break
+	}
+	if closeErr := stream.Close(); closeErr != nil && s.ctx.Err() == nil {
+		notifyObserver(s.observer, Observation{JobName: s.jobName, PodName: podName, StreamError: closeErr.Error()})
+	}
+}
+
+type onceReadCloser struct {
+	io.ReadCloser
+	once sync.Once
+	err  error
+}
+
+func (r *onceReadCloser) Close() error {
+	r.once.Do(func() { r.err = r.ReadCloser.Close() })
+	return r.err
+}
+
+type logRecordParser struct {
+	partial    []byte
+	previousCR bool
+	truncated  bool
+}
+
+func (p *logRecordParser) Write(chunk []byte, emit func(string)) {
+	for _, b := range chunk {
+		switch b {
+		case '\r':
+			p.emit(emit)
+			p.previousCR = true
+		case '\n':
+			if p.previousCR {
+				p.previousCR = false
+				continue
+			}
+			p.emit(emit)
+		default:
+			p.previousCR = false
+			if len(p.partial) < maxLiveLogRecordBytes {
+				p.partial = append(p.partial, b)
+			} else {
+				p.truncated = true
+			}
+		}
+	}
+}
+
+func (p *logRecordParser) Flush(emit func(string)) {
+	p.emit(emit)
+	p.previousCR = false
+}
+
+func (p *logRecordParser) emit(emit func(string)) {
+	if len(p.partial) == 0 && !p.truncated {
+		return
+	}
+	record := string(p.partial)
+	if p.truncated {
+		record += "…"
+	}
+	p.partial = p.partial[:0]
+	p.truncated = false
+	emit(record)
+}
+
+func podWaitingReason(pod *corev1.Pod) string {
+	statuses := append([]corev1.ContainerStatus(nil), pod.Status.InitContainerStatuses...)
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+	for _, status := range statuses {
+		if status.State.Waiting != nil && status.State.Waiting.Reason != "" {
+			return status.State.Waiting.Reason
+		}
+	}
+	return ""
+}
+
+func notifyObserver(observer Observer, observation Observation) {
+	if observer == nil {
+		return
+	}
+	func() {
+		defer func() { _ = recover() }()
+		observer(observation)
+	}()
+}
+
+func notifyObservers(observers []Observer, observation Observation) {
+	for _, observer := range observers {
+		notifyObserver(observer, observation)
+	}
 }
 
 func jobLogs(ctx context.Context, client kubernetes.Interface, reader podLogReader, namespace, jobName string) (string, error) {

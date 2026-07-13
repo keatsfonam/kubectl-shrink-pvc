@@ -40,14 +40,24 @@ type LeaseLock struct {
 	renewal   time.Duration
 }
 
-func AcquireLease(ctx context.Context, client kubernetes.Interface, namespace, pvcName, holder string) (*LeaseLock, error) {
-	return acquireLease(ctx, client, namespace, pvcName, holder, leaseDuration, leaseRenewal)
+type LeaseObservation struct {
+	Name            string
+	Holder          string
+	ResourceVersion string
+	Waiting         bool
+	Acquired        bool
+}
+
+type LeaseObserver func(LeaseObservation)
+
+func AcquireLease(ctx context.Context, client kubernetes.Interface, namespace, pvcName, holder string, observers ...LeaseObserver) (*LeaseLock, error) {
+	return acquireLease(ctx, client, namespace, pvcName, holder, leaseDuration, leaseRenewal, observers...)
 }
 
 // acquireLease uses the same safety rule as client-go leader election: expiry
 // is measured from how long this client has observed an unchanged Lease record,
 // never by comparing a remote client's timestamps with the local wall clock.
-func acquireLease(ctx context.Context, client kubernetes.Interface, namespace, pvcName, holder string, duration, renewal time.Duration) (*LeaseLock, error) {
+func acquireLease(ctx context.Context, client kubernetes.Interface, namespace, pvcName, holder string, duration, renewal time.Duration, observers ...LeaseObserver) (*LeaseLock, error) {
 	if holder == "" {
 		return nil, fmt.Errorf("lease holder identity is required")
 	}
@@ -79,6 +89,7 @@ func acquireLease(ctx context.Context, client kubernetes.Interface, namespace, p
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Spec: desired,
 		}, metav1.CreateOptions{})
 		if err == nil {
+			notifyLeaseObservers(observers, LeaseObservation{Name: name, Holder: holder, Acquired: true})
 			return startLeaseLock(ctx, client, namespace, name, holder, renewal), nil
 		}
 		if !apierrors.IsAlreadyExists(err) {
@@ -89,14 +100,22 @@ func acquireLease(ctx context.Context, client kubernetes.Interface, namespace, p
 		if err != nil {
 			return nil, fmt.Errorf("inspect operation lock %s/%s: %w", namespace, name, err)
 		}
+		existingHolder := "unknown"
+		if existing.Spec.HolderIdentity != nil {
+			existingHolder = *existing.Spec.HolderIdentity
+		}
+		notifyLeaseObservers(observers, LeaseObservation{Name: name, Holder: existingHolder, ResourceVersion: existing.ResourceVersion, Waiting: true})
 		if observed == nil || observed.resourceVersion != existing.ResourceVersion || !reflect.DeepEqual(observed.spec, existing.Spec) {
 			observed = &observedRecord{spec: *existing.Spec.DeepCopy(), resourceVersion: existing.ResourceVersion}
 			observedAt = time.Now()
 		}
 		if time.Since(observedAt) >= duration {
 			existing.Spec = desired
-			if _, err = client.CoordinationV1().Leases(namespace).Update(ctx, existing, metav1.UpdateOptions{}); err == nil {
+			if updated, updateErr := client.CoordinationV1().Leases(namespace).Update(ctx, existing, metav1.UpdateOptions{}); updateErr == nil {
+				notifyLeaseObservers(observers, LeaseObservation{Name: name, Holder: holder, ResourceVersion: updated.ResourceVersion, Acquired: true})
 				return startLeaseLock(ctx, client, namespace, name, holder, renewal), nil
+			} else {
+				err = updateErr
 			}
 			if !apierrors.IsConflict(err) && !apierrors.IsNotFound(err) {
 				return nil, fmt.Errorf("take over operation lock %s/%s: %w", namespace, name, err)
@@ -114,6 +133,18 @@ func acquireLease(ctx context.Context, client kubernetes.Interface, namespace, p
 			return nil, fmt.Errorf("operation lock %s/%s is held by %s: %w", namespace, name, owner, ctx.Err())
 		case <-timer.C:
 		}
+	}
+}
+
+func notifyLeaseObservers(observers []LeaseObserver, observation LeaseObservation) {
+	for _, observer := range observers {
+		if observer == nil {
+			continue
+		}
+		func() {
+			defer func() { _ = recover() }()
+			observer(observation)
+		}()
 	}
 }
 

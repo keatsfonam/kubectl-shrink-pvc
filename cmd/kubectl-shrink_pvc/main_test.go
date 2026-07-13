@@ -1,13 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
 
 func TestRootCommandExposesSafeRecoveryFlags(t *testing.T) {
 	cmd := newRootCmd()
-	for _, name := range []string{"resume", "rsync-arg", "rsync-extra-args", "size"} {
+	for _, name := range []string{"resume", "quiet", "rsync-arg", "rsync-extra-args", "size"} {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Fatalf("expected --%s flag", name)
 		}
@@ -17,6 +18,45 @@ func TestRootCommandExposesSafeRecoveryFlags(t *testing.T) {
 	}
 	if flag := cmd.Flags().Lookup("rsync-extra-args"); flag.Deprecated == "" {
 		t.Fatal("--rsync-extra-args must be marked deprecated")
+	}
+	quiet := cmd.LocalNonPersistentFlags().Lookup("quiet")
+	if quiet == nil {
+		t.Fatal("--quiet must be a local root flag")
+	}
+	if quiet.Value.Type() != "bool" || quiet.DefValue != "false" {
+		t.Fatalf("--quiet type/default = %s/%s, want bool/false", quiet.Value.Type(), quiet.DefValue)
+	}
+	if quiet.Shorthand != "" {
+		t.Fatalf("--quiet unexpectedly has shorthand -%s", quiet.Shorthand)
+	}
+	if cmd.PersistentFlags().Lookup("quiet") != nil {
+		t.Fatal("--quiet must not be persistent")
+	}
+}
+
+func TestRootHelpDocumentsQuietWithoutChangingHelpOrVersionBehavior(t *testing.T) {
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"--help"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("help returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), "--quiet") || !strings.Contains(out.String(), "suppress live progress") {
+		t.Fatalf("help does not document --quiet:\n%s", out.String())
+	}
+
+	versionCmd := newRootCmd()
+	out.Reset()
+	versionCmd.SetOut(&out)
+	versionCmd.SetErr(&out)
+	versionCmd.SetArgs([]string{"--version"})
+	if err := versionCmd.Execute(); err != nil {
+		t.Fatalf("version returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), version) {
+		t.Fatalf("version output = %q, want %q", out.String(), version)
 	}
 }
 

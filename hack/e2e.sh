@@ -122,7 +122,11 @@ kubectl create namespace "$ns"
 echo "=== dry run makes no changes"
 workload data 0
 want=$(seed data)
-"$bin" data --size 512Mi -n "$ns" --dry-run
+dry_out=$("$bin" data --size 512Mi -n "$ns" --dry-run --quiet)
+printf '%s\n' "$dry_out"
+[[ $dry_out == *"PVC shrink plan"* ]] || fail "quiet dry run omitted execution plan"
+[[ $dry_out == *"Dry-run only; no changes made."* ]] || fail "quiet dry run omitted result"
+[[ $dry_out != *"[progress]"* ]] || fail "quiet dry run emitted progress"
 [[ $(pvc_size data) == 1Gi ]] || fail "dry run resized the PVC"
 kubectl -n "$ns" get pvc data-shrink-tmp >/dev/null 2>&1 && fail "dry run created a temp PVC"
 
@@ -132,20 +136,30 @@ fail_want=$(seed failcopy)
 if out=$("$bin" failcopy --size 512Mi -n "$ns" --yes --image "$E2E_ALPINE_IMAGE" 2>&1); then
 	fail "expected copy failure, got success"
 fi
+[[ $out == *"[progress]"* && $out == *"Error:"* ]] || fail "normal failure omitted progress or error output: $out"
 kubectl -n "$ns" rollout status deploy/app-failcopy --timeout=180s
 [[ $(pvc_size failcopy) == 1Gi ]] || fail "copy failure changed source PVC size"
 fail_got=$(checksum failcopy)
 [[ $fail_got == "$fail_want" ]] || fail "copy failure changed source data: $fail_got != $fail_want"
 prepared_state=$(kubectl -n "$ns" get configmap failcopy-shrink-state -o jsonpath='{.data.state\.json}')
 echo "$prepared_state" | grep -q '"phase":"Prepared"' || fail "copy failure did not retain a Prepared recovery checkpoint"
-"$bin" failcopy --size 512Mi -n "$ns" --resume --image "$E2E_ALPINE_IMAGE"
+prepared_out=$("$bin" failcopy --size 512Mi -n "$ns" --resume --image "$E2E_ALPINE_IMAGE" --quiet)
+printf '%s\n' "$prepared_out"
+[[ $prepared_out == *"Recovered pre-copy operation state and restored Deployment replicas"* ]] || fail "quiet prepared recovery omitted result"
+[[ $prepared_out != *"[progress]"* ]] || fail "quiet prepared recovery emitted progress"
 kubectl -n "$ns" get configmap failcopy-shrink-state >/dev/null 2>&1 && fail "Prepared recovery did not clean operation state"
 kubectl -n "$ns" get pvc failcopy-shrink-tmp >/dev/null 2>&1 && fail "Prepared recovery did not clean the unverified temp PVC"
 
 echo "=== full replace as root preserves PVC and filesystem metadata"
 kubectl -n "$ns" exec deploy/app-data -- chown 123:234 /data/files/blob1
 kubectl -n "$ns" exec deploy/app-data -- chmod 640 /data/files/blob1
-"$bin" data --size 512Mi -n "$ns" --yes
+root_out=$("$bin" data --size 512Mi -n "$ns" --yes)
+printf '%s\n' "$root_out"
+[[ $root_out == *"[progress]"* && $root_out == *"total="* && $root_out == *"phase="* ]] || fail "normal run omitted elapsed progress snapshots"
+[[ $root_out == *"copy 1 of 2: source to temporary"* ]] || fail "normal run omitted first copy label"
+[[ $root_out == *"copy 2 of 2: temporary to source"* ]] || fail "normal run omitted second copy label"
+[[ $root_out == *"Source usage:"* && $root_out == *"PVC shrink workflow completed successfully."* ]] || fail "normal run omitted durable results"
+[[ $root_out != *$'\r'* && $root_out != *$'\033'* ]] || fail "redirected progress contained terminal redraw controls"
 kubectl -n "$ns" rollout status deploy/app-data --timeout=180s
 [[ $(pvc_size data) == 512Mi ]] || fail "PVC was not resized, got $(pvc_size data)"
 got=$(checksum data)
@@ -157,7 +171,10 @@ kubectl -n "$ns" get pvc data-shrink-tmp >/dev/null 2>&1 && fail "temp PVC was n
 echo "=== full replace as non-root applies single-user ownership semantics"
 workload data2 1000
 want=$(seed data2)
-"$bin" data2 --size 512Mi -n "$ns" --yes --run-as-user 1000
+quiet_out=$("$bin" data2 --size 512Mi -n "$ns" --yes --run-as-user 1000 --quiet)
+printf '%s\n' "$quiet_out"
+[[ $quiet_out == *"PVC shrink plan"* && $quiet_out == *"Source usage:"* && $quiet_out == *"PVC shrink workflow completed successfully."* ]] || fail "quiet normal run omitted durable output"
+[[ $quiet_out != *"[progress]"* && $quiet_out != *"copy 1 of 2"* && $quiet_out != *"cleanup/"* ]] || fail "quiet normal run emitted progress or activity"
 kubectl -n "$ns" rollout status deploy/app-data2 --timeout=180s
 [[ $(pvc_size data2) == 512Mi ]] || fail "PVC was not resized, got $(pvc_size data2)"
 got=$(checksum data2)
@@ -201,6 +218,10 @@ fi
 kill "$child_pid"
 wait "$child_pid" 2>/dev/null || true
 child_pid=
+grep -q '\[progress\]' "$root/e2e-interrupted.log" || fail "redirected interrupted run omitted progress snapshots"
+if grep -q $'\r' "$root/e2e-interrupted.log" || grep -q $'\033' "$root/e2e-interrupted.log"; then
+	fail "redirected interrupted run contained terminal redraw controls"
+fi
 kubectl -n "$ns" patch pvc interrupted --type=json -p='[{"op":"remove","path":"/metadata/finalizers"}]'
 kubectl -n "$ns" wait --for=delete pvc/interrupted --timeout=120s
 
@@ -228,6 +249,9 @@ for _ in {1..45}; do
 	sleep 1
 done
 [[ $resumed == true ]] || fail "resume never acquired the expired operation Lease"
+[[ $out == *"[progress]"* && $out == *"copy-back/"* ]] || fail "normal resume omitted recovery progress: $out"
+[[ $out == *"PVC shrink workflow resumed and completed successfully."* ]] || fail "normal resume omitted final result: $out"
+[[ $out != *$'\r'* && $out != *$'\033'* ]] || fail "redirected resume progress contained terminal controls"
 kubectl -n "$ns" rollout status deploy/app-interrupted --timeout=180s
 [[ $(pvc_size interrupted) == 512Mi ]] || fail "resumed PVC has wrong size"
 resume_got=$(checksum interrupted)
@@ -269,9 +293,11 @@ spec:
             storage: 1Gi
 EOF
 kubectl -n "$ns" rollout status sts/sts --timeout=180s
-if out=$("$bin" data-sts-0 --size 512Mi -n "$ns" --yes 2>&1); then
+if out=$("$bin" data-sts-0 --size 512Mi -n "$ns" --yes --quiet 2>&1); then
 	fail "expected refusal for StatefulSet consumer, got success"
 fi
 echo "$out" | grep -q "unsupported" || fail "unexpected refusal message: $out"
+[[ $out == *"Error:"* ]] || fail "quiet failure omitted Error reporting: $out"
+[[ $out != *"[progress]"* ]] || fail "quiet failure emitted progress: $out"
 
 echo "PASS"

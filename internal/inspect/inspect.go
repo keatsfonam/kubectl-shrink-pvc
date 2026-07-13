@@ -19,6 +19,16 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+type Observation struct {
+	PodName       string
+	PodPhase      corev1.PodPhase
+	WaitingReason string
+	Cleanup       bool
+	Exists        bool
+}
+
+type Observer func(Observation)
+
 type Options struct {
 	Namespace    string
 	PVCName      string
@@ -28,6 +38,7 @@ type Options struct {
 	FSGroup      int64
 	WaitTimeout  time.Duration
 	PollInterval time.Duration
+	Observe      Observer
 }
 
 func UsageBytes(ctx context.Context, client kubernetes.Interface, opts Options) (int64, error) {
@@ -37,11 +48,12 @@ func UsageBytes(ctx context.Context, client kubernetes.Interface, opts Options) 
 	if err != nil {
 		return 0, fmt.Errorf("create inspection pod: %w", err)
 	}
+	notifyObserver(opts.Observe, Observation{PodName: created.Name, PodPhase: created.Status.Phase, Exists: true})
 	defer func() {
-		_ = cleanupPod(context.Background(), client, opts.Namespace, created.Name, opts.WaitTimeout, opts.PollInterval)
+		_ = cleanupPod(context.Background(), client, opts.Namespace, created.Name, opts.WaitTimeout, opts.PollInterval, opts.Observe)
 	}()
 
-	if err := waitForPodCompletion(ctx, client, opts.Namespace, created.Name, opts.WaitTimeout, opts.PollInterval); err != nil {
+	if err := waitForPodCompletion(ctx, client, opts.Namespace, created.Name, opts.WaitTimeout, opts.PollInterval, opts.Observe); err != nil {
 		logs, _ := podLogs(context.Background(), client, opts.Namespace, created.Name)
 		if logs != "" {
 			return 0, fmt.Errorf("%w; logs: %s", err, logs)
@@ -110,18 +122,20 @@ func ParseUsageBytes(logs string) (int64, error) {
 	return value, nil
 }
 
-func cleanupPod(ctx context.Context, client kubernetes.Interface, namespace, name string, timeout, poll time.Duration) error {
+func cleanupPod(ctx context.Context, client kubernetes.Interface, namespace, name string, timeout, poll time.Duration, observers ...Observer) error {
 	if err := client.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete inspection pod: %w", err)
 	}
 	err := wait.PollUntilContextTimeout(ctx, poll, timeout, true, func(ctx context.Context) (bool, error) {
-		_, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		pod, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
+			notifyObservers(observers, Observation{PodName: name, Cleanup: true})
 			return true, nil
 		}
 		if err != nil {
 			return false, fmt.Errorf("get inspection pod during cleanup: %w", err)
 		}
+		notifyObservers(observers, Observation{PodName: name, PodPhase: pod.Status.Phase, Cleanup: true, Exists: true})
 		return false, nil
 	})
 	if wait.Interrupted(err) && ctx.Err() == nil {
@@ -130,12 +144,13 @@ func cleanupPod(ctx context.Context, client kubernetes.Interface, namespace, nam
 	return err
 }
 
-func waitForPodCompletion(ctx context.Context, client kubernetes.Interface, namespace, name string, timeout, poll time.Duration) error {
+func waitForPodCompletion(ctx context.Context, client kubernetes.Interface, namespace, name string, timeout, poll time.Duration, observers ...Observer) error {
 	err := wait.PollUntilContextTimeout(ctx, poll, timeout, true, func(ctx context.Context) (bool, error) {
 		pod, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return false, fmt.Errorf("get inspection pod: %w", err)
 		}
+		notifyObservers(observers, Observation{PodName: name, PodPhase: pod.Status.Phase, WaitingReason: podWaitingReason(pod), Exists: true})
 		switch pod.Status.Phase {
 		case corev1.PodSucceeded:
 			return true, nil
@@ -148,6 +163,31 @@ func waitForPodCompletion(ctx context.Context, client kubernetes.Interface, name
 		return fmt.Errorf("timed out waiting for inspection pod %s/%s", namespace, name)
 	}
 	return err
+}
+
+func podWaitingReason(pod *corev1.Pod) string {
+	for _, status := range append(append([]corev1.ContainerStatus(nil), pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...) {
+		if status.State.Waiting != nil && status.State.Waiting.Reason != "" {
+			return status.State.Waiting.Reason
+		}
+	}
+	return ""
+}
+
+func notifyObserver(observer Observer, observation Observation) {
+	if observer == nil {
+		return
+	}
+	func() {
+		defer func() { _ = recover() }()
+		observer(observation)
+	}()
+}
+
+func notifyObservers(observers []Observer, observation Observation) {
+	for _, observer := range observers {
+		notifyObserver(observer, observation)
+	}
 }
 
 func podLogs(ctx context.Context, client kubernetes.Interface, namespace, name string) (string, error) {

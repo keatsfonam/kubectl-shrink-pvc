@@ -71,6 +71,20 @@ func TestWaitForPVCDeletedAcceptsNotFound(t *testing.T) {
 	}
 }
 
+func TestProgressObserverPanicsCannotChangePVCWaitResults(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	if err := WaitForPVCUnmounted(context.Background(), client, "ns", "data", time.Second, time.Millisecond, func(PVCUnmountObservation) {
+		panic("render failed")
+	}); err != nil {
+		t.Fatalf("unmount observer changed wait result: %v", err)
+	}
+	if err := WaitForPVCDeleted(context.Background(), client, "ns", "data", "uid", time.Second, time.Millisecond, func(PVCDeletionObservation) {
+		panic("render failed")
+	}); err != nil {
+		t.Fatalf("deletion observer changed wait result: %v", err)
+	}
+}
+
 func TestRestoreDeploymentsAttemptsEveryDeployment(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	var updates []string

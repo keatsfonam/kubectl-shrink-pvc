@@ -17,9 +17,14 @@ import (
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/kube"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/naming"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/operation"
+	liveprogress "github.com/keatsfonam/kubectl-shrink-pvc/internal/progress"
 )
 
 func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namespace string, requestedTarget resource.Quantity) (retErr error) {
+	if cfg.reporter == nil {
+		cfg.reporter = liveprogress.New(cfg.IOStreams.Out, cfg.Quiet)
+		defer cfg.reporter.Close()
+	}
 	store, err := operation.StoreForPVC(client, namespace, cfg.PVCName).Resolve(ctx)
 	if err != nil {
 		return err
@@ -61,18 +66,24 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		resourceVersion, updateErr = store.Update(ctx, state, resourceVersion)
 		return updateErr
 	}
-	mover := datamover.RsyncMover{Client: client}
+	mover := cfg.mover
+	if mover == nil {
+		mover = datamover.RsyncMover{Client: client}
+	}
 	scaled := false
 	restoreOnExit := true
 	defer func() {
 		if !scaled || !restoreOnExit {
 			return
 		}
+		setProgressPhase(cfg, liveprogress.RestoreControllers, fmt.Sprintf("restoring %d Deployment replica target(s) while resuming", len(state.Deployments)))
 		restoreCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 		defer cancel()
 		if err := kube.RestoreDeployments(restoreCtx, client, state.Deployments); err != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("restore Deployment replicas while resuming: %w", err))
+			return
 		}
+		setProgressPhase(cfg, liveprogress.RestoreObservingConsumers, "Deployment replica targets restored; application readiness is not used as a workflow gate")
 	}()
 
 	if state.Phase == operation.PhasePrepared {
@@ -88,9 +99,11 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 			return fmt.Errorf("source PVC %s/%s was replaced; refusing prepared-state recovery", namespace, state.SourceName)
 		}
 		if !state.NoScale && len(state.Deployments) > 0 {
+			setProgressPhase(cfg, liveprogress.RestoreControllers, fmt.Sprintf("restoring %d Deployment replica target(s) from prepared recovery state", len(state.Deployments)))
 			if err := kube.RestoreDeployments(ctx, client, state.Deployments); err != nil {
 				return fmt.Errorf("restore Deployment replicas from prepared state: %w", err)
 			}
+			setProgressPhase(cfg, liveprogress.RestoreObservingConsumers, "Deployment replica targets restored; application readiness is not used as a recovery gate")
 		}
 		temp, getErr := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, state.TempName, metav1.GetOptions{})
 		if getErr == nil {
@@ -99,16 +112,20 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 				temp.Annotations[tempSourceNameAnnotation] != state.SourceName {
 				return fmt.Errorf("temporary PVC %s/%s is not owned by prepared operation", namespace, state.TempName)
 			}
+			setProgressPhase(cfg, liveprogress.CleanupTempPVC, fmt.Sprintf("deleting prepared-state temporary PVC %s/%s with expected uid=%s", namespace, state.TempName, temp.UID))
 			if err := kube.DeletePVC(ctx, client, namespace, state.TempName, temp.UID); err != nil {
 				return err
 			}
+			progressActivity(cfg, fmt.Sprintf("temporary PVC %s/%s delete request accepted", namespace, state.TempName))
 		} else if !apierrors.IsNotFound(getErr) {
 			return fmt.Errorf("inspect temporary PVC during prepared-state recovery: %w", getErr)
 		}
+		setProgressPhase(cfg, liveprogress.CleanupCheckpoint, fmt.Sprintf("deleting prepared recovery checkpoint for PVC %s/%s", namespace, state.SourceName))
 		if err := store.Delete(ctx, stateCM.UID); err != nil {
 			return err
 		}
-		fmt.Fprintln(cfg.IOStreams.Out, "Recovered pre-copy operation state and restored Deployment replicas; rerun the shrink command to start a fresh verified copy.")
+		progressActivity(cfg, fmt.Sprintf("prepared recovery checkpoint for PVC %s/%s removed", namespace, state.SourceName))
+		durableOutput(cfg, cfg.IOStreams.Out, "Recovered pre-copy operation state and restored Deployment replicas; rerun the shrink command to start a fresh verified copy.\n")
 		return nil
 	}
 
@@ -121,6 +138,7 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		switch {
 		case apierrors.IsNotFound(getErr):
 			// The process may have exited after deletion but before checkpointing.
+			setProgressPhase(cfg, liveprogress.ReplaceSourceDeleting, fmt.Sprintf("original PVC %s/%s is already absent", namespace, state.SourceName))
 			restoreOnExit = false
 			if err := updatePhase(operation.PhaseSourceDeleted); err != nil {
 				return err
@@ -131,12 +149,15 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 			return fmt.Errorf("source PVC %s/%s was replaced by an unowned object; refusing to resume", namespace, state.SourceName)
 		default:
 			if !state.NoScale && len(state.Deployments) > 0 {
+				setProgressPhase(cfg, liveprogress.QuiesceScalingConsumers, fmt.Sprintf("requesting zero replicas for %d Deployment(s) while resuming", len(state.Deployments)))
 				scaled = true // ensure a final restoration attempt after any partial scale failure
 				if err := kube.ScaleDeployments(ctx, client, state.Deployments, 0); err != nil {
 					return err
 				}
+				progressActivity(cfg, fmt.Sprintf("zero-replica scale requests accepted for %d Deployment(s)", len(state.Deployments)))
 			}
-			if err := kube.WaitForPVCUnmounted(ctx, client, namespace, state.SourceName, cfg.Timeout, pollInterval); err != nil {
+			setProgressPhase(cfg, liveprogress.QuiesceWaitingForUnmount, fmt.Sprintf("observing active Pods that reference PVC %s/%s", namespace, state.SourceName))
+			if err := kube.WaitForPVCUnmounted(ctx, client, namespace, state.SourceName, cfg.Timeout, pollInterval, pvcUnmountObserver(cfg, namespace, state.SourceName)); err != nil {
 				return err
 			}
 			if err := validateDestructiveBoundary(ctx, client, namespace, state.SourceName, state.OriginalSourceUID, state.Deployments, state.NoScale); err != nil {
@@ -146,6 +167,7 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 			if err := updatePhase(operation.PhaseSourceDeleteRequested); err != nil {
 				return err
 			}
+			setProgressPhase(cfg, liveprogress.ReplaceSourceDeleting, fmt.Sprintf("deleting original PVC %s/%s with expected uid=%s while resuming", namespace, state.SourceName, state.OriginalSourceUID))
 			if err := kube.DeletePVC(ctx, client, namespace, state.SourceName, state.OriginalSourceUID); err != nil {
 				return err
 			}
@@ -157,6 +179,7 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 			return err
 		}
 		restoreOnExit = false
+		setProgressPhase(cfg, liveprogress.ReplaceSourceDeleting, fmt.Sprintf("observing deletion of original PVC %s/%s with expected uid=%s", namespace, state.SourceName, state.OriginalSourceUID))
 		if err := validateWorkloadsQuiesced(ctx, client, namespace, state.SourceName, state.Deployments, state.NoScale); err != nil {
 			return fmt.Errorf("revalidate workloads after delete request: %w", err)
 		}
@@ -164,6 +187,7 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		switch {
 		case apierrors.IsNotFound(getErr):
 			// The prior request succeeded even if its response was lost.
+			progressActivity(cfg, fmt.Sprintf("original PVC %s/%s is already absent", namespace, state.SourceName))
 		case getErr != nil:
 			return fmt.Errorf("inspect source after delete request: %w", getErr)
 		case source.UID != state.OriginalSourceUID:
@@ -175,7 +199,7 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 				return err
 			}
 		}
-		if err := kube.WaitForPVCDeleted(ctx, client, namespace, state.SourceName, state.OriginalSourceUID, cfg.Timeout, pollInterval); err != nil {
+		if err := kube.WaitForPVCDeleted(ctx, client, namespace, state.SourceName, state.OriginalSourceUID, cfg.Timeout, pollInterval, pvcDeletionObserver(cfg, namespace, state.SourceName)); err != nil {
 			return err
 		}
 		if err := updatePhase(operation.PhaseSourceDeleted); err != nil {
@@ -190,6 +214,7 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		if err := validateWorkloadsQuiesced(ctx, client, namespace, state.SourceName, state.Deployments, state.NoScale); err != nil {
 			return fmt.Errorf("revalidate workloads before recreating source: %w", err)
 		}
+		setProgressPhase(cfg, liveprogress.ReplaceSourceCreating, fmt.Sprintf("ensuring replacement PVC %s/%s exists while resuming", namespace, state.SourceName))
 		recreated, getErr := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, state.SourceName, metav1.GetOptions{})
 		if apierrors.IsNotFound(getErr) {
 			recreated, err = client.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, &finalPVC, metav1.CreateOptions{})
@@ -201,6 +226,11 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		} else if err := operation.ValidateRecreatedPVC(recreated, state.OperationID); err != nil {
 			return fmt.Errorf("same-name PVC appeared during recovery: %w", err)
 		}
+		recreatedPhase := string(recreated.Status.Phase)
+		if recreatedPhase == "" {
+			recreatedPhase = "unknown"
+		}
+		setProgressPhase(cfg, liveprogress.ReplaceSourceProvisioning, fmt.Sprintf("replacement PVC %s/%s observed uid=%s phase=%s", namespace, state.SourceName, recreated.UID, recreatedPhase))
 		state.RecreatedSourceUID = recreated.UID
 		if err := updatePhase(operation.PhaseSourceRecreated); err != nil {
 			return err
@@ -224,19 +254,37 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		if err := operation.ValidateRecreatedPVC(recreated, state.OperationID); err != nil {
 			return err
 		}
-		fmt.Fprintf(cfg.IOStreams.Out, "Resuming copy %s -> %s...\n", state.TempName, state.SourceName)
+		recreatedPhase := string(recreated.Status.Phase)
+		if recreatedPhase == "" {
+			recreatedPhase = "unknown"
+		}
+		setProgressPhase(cfg, liveprogress.ReplaceSourceProvisioning, fmt.Sprintf("replacement PVC %s/%s observed uid=%s phase=%s", namespace, state.SourceName, recreated.UID, recreatedPhase))
+		copyBackLabel := "copy 2 of 2: temporary to source"
+		setProgressPhase(cfg, liveprogress.CopyBackScheduling, fmt.Sprintf("creating resumed rsync Job for %s", copyBackLabel))
 		copyBack := datamover.Request{
 			Namespace: namespace, SourcePVC: state.TempName, DestPVC: state.SourceName, Image: state.Image,
 			JobName: naming.SafeDNSLabel("shrink-copy-back-" + state.SourceName), Args: state.RsyncArgs,
 			RunAsUser: state.RunAsUser, FSGroup: state.FSGroup,
 			WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
+			Observe: moverObserver(cfg, moverProgressSpec{
+				scheduling: liveprogress.CopyBackScheduling, mounting: liveprogress.CopyBackMounting,
+				running: liveprogress.CopyBackTransferring, preparationMount: liveprogress.ReplaceSourceMounting,
+				copyLabel: copyBackLabel,
+			}),
 		}
 		if err := mover.Move(ctx, copyBack); err != nil {
 			return err
 		}
-		if err := mover.Verify(ctx, copyBack); err != nil {
+		setProgressPhase(cfg, liveprogress.VerifySourceScheduling, "creating checksum verification Job for replacement source while resuming")
+		verifySource := copyBack
+		verifySource.Observe = moverObserver(cfg, moverProgressSpec{
+			scheduling: liveprogress.VerifySourceScheduling, mounting: liveprogress.VerifySourceScheduling,
+			running: liveprogress.VerifySourceChecksumming, verificationLabel: "replacement source verification",
+		})
+		if err := mover.Verify(ctx, verifySource); err != nil {
 			return err
 		}
+		setProgressPhase(cfg, liveprogress.VerifySourceCompleted, "replacement source checksum verification completed without differences")
 		if err := updatePhase(operation.PhaseCopiedBack); err != nil {
 			return err
 		}
@@ -253,6 +301,7 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		// final attempt armed until the full set is restored successfully.
 		restoreOnExit = true
 		scaled = true
+		setProgressPhase(cfg, liveprogress.RestoreControllers, fmt.Sprintf("restoring %d Deployment replica target(s) while resuming", len(state.Deployments)))
 		restoreCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 		err := kube.RestoreDeployments(restoreCtx, client, state.Deployments)
 		cancel()
@@ -260,16 +309,21 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 			return fmt.Errorf("restore Deployment replicas while resuming: %w", err)
 		}
 		scaled = false
+		setProgressPhase(cfg, liveprogress.RestoreObservingConsumers, "Deployment replica targets restored; application readiness is not used as a recovery gate")
 	}
 	if !state.KeepTemp {
+		setProgressPhase(cfg, liveprogress.CleanupTempPVC, fmt.Sprintf("deleting temporary recovery PVC %s/%s with expected uid=%s", namespace, state.TempName, state.TempUID))
 		if err := kube.DeletePVC(ctx, client, namespace, state.TempName, state.TempUID); err != nil {
 			return err
 		}
+		progressActivity(cfg, fmt.Sprintf("temporary recovery PVC %s/%s delete request accepted", namespace, state.TempName))
 	}
+	setProgressPhase(cfg, liveprogress.CleanupCheckpoint, fmt.Sprintf("deleting recovery checkpoint for PVC %s/%s", namespace, state.SourceName))
 	if err := store.Delete(ctx, stateCM.UID); err != nil {
 		return err
 	}
-	fmt.Fprintln(cfg.IOStreams.Out, "PVC shrink workflow resumed and completed successfully.")
+	progressActivity(cfg, fmt.Sprintf("recovery checkpoint for PVC %s/%s removed", namespace, state.SourceName))
+	durableOutput(cfg, cfg.IOStreams.Out, "PVC shrink workflow resumed and completed successfully.\n")
 	return nil
 }
 

@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
@@ -12,8 +13,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/datamover"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/kube"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/operation"
+	liveprogress "github.com/keatsfonam/kubectl-shrink-pvc/internal/progress"
 )
 
 func TestRunRejectsDryRunResumeBeforeClusterAccess(t *testing.T) {
@@ -265,6 +268,95 @@ func TestEnsureTemporaryPVCReusesExistingMatchingSize(t *testing.T) {
 	}
 	if got.Name != tempPVC.Name {
 		t.Fatalf("unexpected PVC returned: %s", got.Name)
+	}
+}
+
+func TestCopyActivityUsesIndependentPerCopyLabels(t *testing.T) {
+	first := copyActivity("copy 1 of 2: source to temporary", "1,024 25% 1.0MB/s")
+	second := copyActivity("copy 2 of 2: temporary to source", "2,048 75% 2.0MB/s")
+	for _, test := range []struct {
+		got   string
+		label string
+		pct   string
+	}{
+		{got: first, label: "copy 1 of 2: source to temporary", pct: "per-copy progress=25%"},
+		{got: second, label: "copy 2 of 2: temporary to source", pct: "per-copy progress=75%"},
+	} {
+		if !strings.Contains(test.got, test.label) || !strings.Contains(test.got, test.pct) {
+			t.Fatalf("copy activity %q missing label or per-copy percentage", test.got)
+		}
+		if strings.Contains(strings.ToLower(test.got), "overall") || strings.Contains(strings.ToLower(test.got), "eta") {
+			t.Fatalf("copy activity claims non-portable aggregate progress: %q", test.got)
+		}
+	}
+}
+
+func TestVerificationJobCompletionDoesNotPublishCompletedDisplayPhase(t *testing.T) {
+	var out bytes.Buffer
+	cfg := Config{}
+	cfg.reporter = liveprogress.New(&out, false)
+	observer := moverObserver(cfg, moverProgressSpec{
+		scheduling: liveprogress.VerifyTempScheduling,
+		mounting:   liveprogress.VerifyTempScheduling,
+		running:    liveprogress.VerifyTempChecksumming,
+	})
+	observer(datamover.Observation{JobName: "verify", JobCondition: "Complete"})
+	cfg.reporter.Close()
+
+	got := out.String()
+	if !strings.Contains(got, "verify-temp/checksumming") {
+		t.Fatalf("Job completion did not retain checksumming phase: %s", got)
+	}
+	if strings.Contains(got, "verify-temp/completed") {
+		t.Fatalf("Job condition alone incorrectly published verification completion: %s", got)
+	}
+}
+
+func TestQuietRetainsDurableStdoutAndStderrContracts(t *testing.T) {
+	for _, quiet := range []bool{false, true} {
+		t.Run(map[bool]string{false: "default", true: "quiet"}[quiet], func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			cfg := Config{PVCName: "data", TempName: "data-temp", SafetyMarginPercent: 10, Quiet: quiet}
+			cfg.IOStreams.In = strings.NewReader("yes\n")
+			cfg.IOStreams.Out = &out
+			cfg.IOStreams.ErrOut = &errOut
+			cfg.reporter = liveprogress.New(&out, quiet)
+
+			source := pvc("data", "ns", "2Gi")
+			printPlan(cfg, "ns", source, resource.MustParse("1Gi"), &kube.ConsumerPlan{})
+			if err := confirm(cfg); err != nil {
+				t.Fatalf("confirm returned error: %v", err)
+			}
+			setProgressPhase(cfg, liveprogress.InspectScanning, "inspection Pod running")
+			durableOutput(cfg, cfg.IOStreams.Out, "Source usage: 100 bytes; required with 10% margin: 110 bytes; target: 1000 bytes.\n")
+			durableOutput(cfg, cfg.IOStreams.Out, "\nDry-run only; no changes made.\n")
+			setProgressPhase(cfg, liveprogress.CleanupCheckpoint, "checkpoint removed")
+			durableOutput(cfg, cfg.IOStreams.Out, "PVC shrink workflow completed successfully.\n")
+			durableOutput(cfg, cfg.IOStreams.ErrOut, "Warning: preserved warning text.\n")
+			cfg.reporter.Close()
+
+			got := out.String()
+			for _, required := range []string{
+				"PVC shrink plan", "Continue? Type 'yes' to proceed:", "Source usage: 100 bytes",
+				"Dry-run only; no changes made.", "PVC shrink workflow completed successfully.",
+			} {
+				if !strings.Contains(got, required) {
+					t.Fatalf("quiet=%t output missing %q:\n%s", quiet, required, got)
+				}
+			}
+			if !strings.Contains(got, "Continue? Type 'yes' to proceed: \n") {
+				t.Fatalf("quiet=%t confirmation prompt was joined to later output:\n%s", quiet, got)
+			}
+			if errOut.String() != "Warning: preserved warning text.\n" {
+				t.Fatalf("quiet=%t stderr = %q", quiet, errOut.String())
+			}
+			if quiet && strings.Contains(got, "[progress]") {
+				t.Fatalf("quiet output contains progress: %s", got)
+			}
+			if !quiet && !strings.Contains(got, "inspect/scanning") {
+				t.Fatalf("default output missing progress: %s", got)
+			}
+		})
 	}
 }
 

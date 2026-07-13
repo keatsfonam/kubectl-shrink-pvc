@@ -23,8 +23,14 @@ import (
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/kube"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/naming"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/operation"
+	liveprogress "github.com/keatsfonam/kubectl-shrink-pvc/internal/progress"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/pvcmanifest"
 )
+
+type dataMover interface {
+	Move(context.Context, datamover.Request) error
+	Verify(context.Context, datamover.Request) error
+}
 
 type Config struct {
 	PVCName             string
@@ -34,6 +40,7 @@ type Config struct {
 	KeepTemp            bool
 	NoScale             bool
 	Resume              bool
+	Quiet               bool
 	TempName            string
 	Image               string
 	RsyncArgs           []string
@@ -44,6 +51,8 @@ type Config struct {
 	Timeout             time.Duration
 	IOStreams           genericclioptions.IOStreams
 	ConfigFlags         *genericclioptions.ConfigFlags
+	reporter            *liveprogress.Reporter
+	mover               dataMover
 }
 
 const (
@@ -55,6 +64,9 @@ const (
 )
 
 func Run(ctx context.Context, cfg Config) (retErr error) {
+	cfg.reporter = liveprogress.New(cfg.IOStreams.Out, cfg.Quiet)
+	defer cfg.reporter.Close()
+
 	if cfg.DryRun && cfg.Resume {
 		return fmt.Errorf("--dry-run cannot be combined with --resume")
 	}
@@ -76,7 +88,7 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	}
 	cfg.RsyncArgs = normalizedArgs
 	if cfg.RsyncExtraArgs != "" {
-		fmt.Fprintln(cfg.IOStreams.ErrOut, "Warning: --rsync-extra-args is deprecated; use repeatable --rsync-arg=--option=value instead.")
+		durableOutput(cfg, cfg.IOStreams.ErrOut, "Warning: --rsync-extra-args is deprecated; use repeatable --rsync-arg=--option=value instead.\n")
 	}
 
 	target, err := resource.ParseQuantity(cfg.TargetSize)
@@ -124,7 +136,7 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 
 	printPlan(cfg, namespace, source, target, plan)
 	if cfg.DryRun {
-		fmt.Fprintln(cfg.IOStreams.Out, "\nDry-run only; no changes made.")
+		durableOutput(cfg, cfg.IOStreams.Out, "\nDry-run only; no changes made.\n")
 		return nil
 	}
 	if err := validateConsumers(plan, cfg.NoScale); err != nil {
@@ -186,37 +198,40 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 				return
 			}
 			if !restoreOnExit {
-				fmt.Fprintln(cfg.IOStreams.ErrOut, "Warning: not restoring Deployment replicas because the original PVC replacement did not complete. Restore manually after recovery.")
+				durableOutput(cfg, cfg.IOStreams.ErrOut, "Warning: not restoring Deployment replicas because the original PVC replacement did not complete. Restore manually after recovery.\n")
 				return
 			}
-			fmt.Fprintln(cfg.IOStreams.Out, "Restoring Deployment replica counts...")
+			setProgressPhase(cfg, liveprogress.RestoreControllers, fmt.Sprintf("restoring %d Deployment replica target(s) after workflow exit", len(plan.Deployments)))
 			restoreCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 			defer cancel()
 			if err := kube.RestoreDeployments(restoreCtx, client, plan.Deployments); err != nil {
 				restoreErr := fmt.Errorf("restore Deployment replicas: %w", err)
-				fmt.Fprintf(cfg.IOStreams.ErrOut, "Warning: %v\n", restoreErr)
+				durableOutputf(cfg, cfg.IOStreams.ErrOut, "Warning: %v\n", restoreErr)
 				retErr = errors.Join(retErr, restoreErr)
+				return
 			}
+			setProgressPhase(cfg, liveprogress.RestoreObservingConsumers, "Deployment replica targets restored; application readiness is not used as a workflow gate")
 		}()
 
 		if !cfg.NoScale && len(plan.Deployments) > 0 {
-			fmt.Fprintln(cfg.IOStreams.Out, "Scaling Deployments to zero...")
+			setProgressPhase(cfg, liveprogress.QuiesceScalingConsumers, fmt.Sprintf("requesting zero replicas for %d Deployment(s)", len(plan.Deployments)))
 			scaled = true // any attempted write must receive a final restoration attempt
 			if err := kube.ScaleDeployments(ctx, client, plan.Deployments, 0); err != nil {
 				return err
 			}
+			progressActivity(cfg, fmt.Sprintf("zero-replica scale requests accepted for %d Deployment(s)", len(plan.Deployments)))
 		}
 
-		fmt.Fprintln(cfg.IOStreams.Out, "Waiting for source PVC to be unmounted...")
-		if err := kube.WaitForPVCUnmounted(ctx, client, namespace, cfg.PVCName, cfg.Timeout, pollInterval); err != nil {
+		setProgressPhase(cfg, liveprogress.QuiesceWaitingForUnmount, fmt.Sprintf("observing active Pods that reference PVC %s/%s", namespace, cfg.PVCName))
+		if err := kube.WaitForPVCUnmounted(ctx, client, namespace, cfg.PVCName, cfg.Timeout, pollInterval, pvcUnmountObserver(cfg, namespace, cfg.PVCName)); err != nil {
 			return err
 		}
 
-		fmt.Fprintln(cfg.IOStreams.Out, "Inspecting source PVC usage...")
+		setProgressPhase(cfg, liveprogress.InspectScheduling, fmt.Sprintf("creating inspection Pod for PVC %s/%s", namespace, cfg.PVCName))
 		usedBytes, err := inspect.UsageBytes(ctx, client, inspect.Options{
 			Namespace: namespace, PVCName: cfg.PVCName, Image: cfg.Image,
 			RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
-			WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
+			WaitTimeout: cfg.Timeout, PollInterval: pollInterval, Observe: inspectionObserver(cfg),
 		})
 		if err != nil {
 			return err
@@ -228,7 +243,7 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		if requiredBytes > target.Value() {
 			return fmt.Errorf("source PVC contains about %d bytes; with %d%% safety margin it requires %d bytes, which exceeds target size %d bytes", usedBytes, cfg.SafetyMarginPercent, requiredBytes, target.Value())
 		}
-		fmt.Fprintf(cfg.IOStreams.Out, "Source usage: %d bytes; required with %d%% margin: %d bytes; target: %d bytes.\n", usedBytes, cfg.SafetyMarginPercent, requiredBytes, target.Value())
+		durableOutputf(cfg, cfg.IOStreams.Out, "Source usage: %d bytes; required with %d%% margin: %d bytes; target: %d bytes.\n", usedBytes, cfg.SafetyMarginPercent, requiredBytes, target.Value())
 
 		tempPVC, err := pvcmanifest.Build(source, cfg.TempName, target)
 		if err != nil {
@@ -240,30 +255,50 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		tempPVC.Annotations[tempSourceUIDAnnotation] = string(source.UID)
 		tempPVC.Annotations[tempSourceNameAnnotation] = source.Name
 		tempPVC.Annotations[operation.AnnotationOperationID] = operationID
-		fmt.Fprintf(cfg.IOStreams.Out, "Creating temporary PVC %s/%s...\n", namespace, cfg.TempName)
+		setProgressPhase(cfg, liveprogress.PrepareTempCreating, fmt.Sprintf("creating temporary PVC %s/%s", namespace, cfg.TempName))
 		tempPVC, reused, err := ensureTemporaryPVC(ctx, client, namespace, tempPVC, target)
 		if err != nil {
 			return err
 		}
+		tempPhase := string(tempPVC.Status.Phase)
+		if tempPhase == "" {
+			tempPhase = "unknown"
+		}
+		setProgressPhase(cfg, liveprogress.PrepareTempProvisioning, fmt.Sprintf("temporary PVC %s/%s observed uid=%s phase=%s", namespace, cfg.TempName, tempPVC.UID, tempPhase))
 		if reused {
-			fmt.Fprintf(cfg.IOStreams.Out, "Temporary PVC %s/%s already exists at the requested size; reusing it.\n", namespace, cfg.TempName)
+			progressActivity(cfg, fmt.Sprintf("temporary PVC %s/%s already exists at the requested size and is owned by this operation", namespace, cfg.TempName))
 		}
 
-		mover := datamover.RsyncMover{Client: client}
-		fmt.Fprintf(cfg.IOStreams.Out, "Copying %s -> %s...\n", cfg.PVCName, cfg.TempName)
+		mover := cfg.mover
+		if mover == nil {
+			mover = datamover.RsyncMover{Client: client}
+		}
+		copyToTempLabel := "copy 1 of 2: source to temporary"
+		setProgressPhase(cfg, liveprogress.CopyToTempScheduling, fmt.Sprintf("creating rsync Job for %s", copyToTempLabel))
 		copyToTemp := datamover.Request{
 			Namespace: namespace, SourcePVC: cfg.PVCName, DestPVC: cfg.TempName, Image: cfg.Image,
 			JobName: naming.SafeDNSLabel("shrink-copy-to-temp-" + cfg.PVCName), Args: cfg.RsyncArgs,
 			RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
 			WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
+			Observe: moverObserver(cfg, moverProgressSpec{
+				scheduling: liveprogress.CopyToTempScheduling, mounting: liveprogress.CopyToTempMounting,
+				running: liveprogress.CopyToTempTransferring, preparationMount: liveprogress.PrepareTempMounting,
+				copyLabel: copyToTempLabel,
+			}),
 		}
 		if err := mover.Move(ctx, copyToTemp); err != nil {
 			return err
 		}
-		fmt.Fprintln(cfg.IOStreams.Out, "Verifying temporary copy...")
-		if err := mover.Verify(ctx, copyToTemp); err != nil {
+		setProgressPhase(cfg, liveprogress.VerifyTempScheduling, "creating checksum verification Job for temporary copy")
+		verifyToTemp := copyToTemp
+		verifyToTemp.Observe = moverObserver(cfg, moverProgressSpec{
+			scheduling: liveprogress.VerifyTempScheduling, mounting: liveprogress.VerifyTempScheduling,
+			running: liveprogress.VerifyTempChecksumming, verificationLabel: "temporary copy verification",
+		})
+		if err := mover.Verify(ctx, verifyToTemp); err != nil {
 			return err
 		}
+		setProgressPhase(cfg, liveprogress.VerifyTempCompleted, "temporary copy checksum verification completed without differences")
 
 		state.TempUID = tempPVC.UID
 		if err := updatePhase(operation.PhaseCopiedToTemp); err != nil {
@@ -279,11 +314,11 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		if err := updatePhase(operation.PhaseSourceDeleteRequested); err != nil {
 			return err
 		}
-		fmt.Fprintf(cfg.IOStreams.Out, "Deleting original PVC %s/%s...\n", namespace, cfg.PVCName)
+		setProgressPhase(cfg, liveprogress.ReplaceSourceDeleting, fmt.Sprintf("deleting original PVC %s/%s with expected uid=%s", namespace, cfg.PVCName, source.UID))
 		if err := kube.DeletePVC(ctx, client, namespace, cfg.PVCName, source.UID); err != nil {
 			return err
 		}
-		if err := kube.WaitForPVCDeleted(ctx, client, namespace, cfg.PVCName, source.UID, cfg.Timeout, pollInterval); err != nil {
+		if err := kube.WaitForPVCDeleted(ctx, client, namespace, cfg.PVCName, source.UID, cfg.Timeout, pollInterval, pvcDeletionObserver(cfg, namespace, cfg.PVCName)); err != nil {
 			return err
 		}
 		if err := updatePhase(operation.PhaseSourceDeleted); err != nil {
@@ -293,11 +328,16 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 			return fmt.Errorf("revalidate workloads before recreating source: %w", err)
 		}
 
-		fmt.Fprintf(cfg.IOStreams.Out, "Recreating original PVC %s/%s at %s...\n", namespace, cfg.PVCName, target.String())
+		setProgressPhase(cfg, liveprogress.ReplaceSourceCreating, fmt.Sprintf("creating replacement PVC %s/%s at %s", namespace, cfg.PVCName, target.String()))
 		recreated, err := client.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, finalPVC, metav1.CreateOptions{})
 		if err != nil {
 			return fmt.Errorf("recreate original PVC: %w", err)
 		}
+		recreatedPhase := string(recreated.Status.Phase)
+		if recreatedPhase == "" {
+			recreatedPhase = "unknown"
+		}
+		setProgressPhase(cfg, liveprogress.ReplaceSourceProvisioning, fmt.Sprintf("replacement PVC %s/%s observed uid=%s phase=%s", namespace, cfg.PVCName, recreated.UID, recreatedPhase))
 		state.RecreatedSourceUID = recreated.UID
 		if err := updatePhase(operation.PhaseSourceRecreated); err != nil {
 			return err
@@ -306,20 +346,32 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 			return fmt.Errorf("revalidate workloads before copy-back: %w", err)
 		}
 
-		fmt.Fprintf(cfg.IOStreams.Out, "Copying %s -> %s...\n", cfg.TempName, cfg.PVCName)
+		copyBackLabel := "copy 2 of 2: temporary to source"
+		setProgressPhase(cfg, liveprogress.CopyBackScheduling, fmt.Sprintf("creating rsync Job for %s", copyBackLabel))
 		copyBack := datamover.Request{
 			Namespace: namespace, SourcePVC: cfg.TempName, DestPVC: cfg.PVCName, Image: cfg.Image,
 			JobName: naming.SafeDNSLabel("shrink-copy-back-" + cfg.PVCName), Args: cfg.RsyncArgs,
 			RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
 			WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
+			Observe: moverObserver(cfg, moverProgressSpec{
+				scheduling: liveprogress.CopyBackScheduling, mounting: liveprogress.CopyBackMounting,
+				running: liveprogress.CopyBackTransferring, preparationMount: liveprogress.ReplaceSourceMounting,
+				copyLabel: copyBackLabel,
+			}),
 		}
 		if err := mover.Move(ctx, copyBack); err != nil {
 			return err
 		}
-		fmt.Fprintln(cfg.IOStreams.Out, "Verifying restored copy...")
-		if err := mover.Verify(ctx, copyBack); err != nil {
+		setProgressPhase(cfg, liveprogress.VerifySourceScheduling, "creating checksum verification Job for replacement source")
+		verifySource := copyBack
+		verifySource.Observe = moverObserver(cfg, moverProgressSpec{
+			scheduling: liveprogress.VerifySourceScheduling, mounting: liveprogress.VerifySourceScheduling,
+			running: liveprogress.VerifySourceChecksumming, verificationLabel: "replacement source verification",
+		})
+		if err := mover.Verify(ctx, verifySource); err != nil {
 			return err
 		}
+		setProgressPhase(cfg, liveprogress.VerifySourceCompleted, "replacement source checksum verification completed without differences")
 		if err := updatePhase(operation.PhaseCopiedBack); err != nil {
 			return err
 		}
@@ -330,6 +382,7 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		// otherwise resume could repeat rsync while applications are writing.
 		restoreOnExit = true
 		if scaled {
+			setProgressPhase(cfg, liveprogress.RestoreControllers, fmt.Sprintf("restoring %d Deployment replica target(s)", len(plan.Deployments)))
 			restoreCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 			err := kube.RestoreDeployments(restoreCtx, client, plan.Deployments)
 			cancel()
@@ -337,19 +390,23 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 				return fmt.Errorf("restore Deployment replicas: %w", err)
 			}
 			scaled = false
+			setProgressPhase(cfg, liveprogress.RestoreObservingConsumers, "Deployment replica targets restored; application readiness is not used as a workflow gate")
 		}
 
 		if !cfg.KeepTemp {
-			fmt.Fprintf(cfg.IOStreams.Out, "Deleting temporary PVC %s/%s...\n", namespace, cfg.TempName)
+			setProgressPhase(cfg, liveprogress.CleanupTempPVC, fmt.Sprintf("deleting temporary PVC %s/%s with expected uid=%s", namespace, cfg.TempName, tempPVC.UID))
 			if err := kube.DeletePVC(ctx, client, namespace, cfg.TempName, tempPVC.UID); err != nil {
 				return err
 			}
+			progressActivity(cfg, fmt.Sprintf("temporary PVC %s/%s delete request accepted", namespace, cfg.TempName))
 		}
+		setProgressPhase(cfg, liveprogress.CleanupCheckpoint, fmt.Sprintf("deleting operation checkpoint for PVC %s/%s", namespace, cfg.PVCName))
 		if err := store.Delete(ctx, stateCM.UID); err != nil {
 			return err
 		}
+		progressActivity(cfg, fmt.Sprintf("operation checkpoint for PVC %s/%s removed", namespace, cfg.PVCName))
 
-		fmt.Fprintln(cfg.IOStreams.Out, "PVC shrink workflow completed successfully.")
+		durableOutput(cfg, cfg.IOStreams.Out, "PVC shrink workflow completed successfully.\n")
 		return nil
 	})
 }
@@ -359,14 +416,28 @@ func withOperationLease(ctx context.Context, cfg Config, client kubernetes.Inter
 	if err != nil {
 		return err
 	}
-	lock, err := operation.AcquireLease(ctx, client, namespace, cfg.PVCName, holder)
+	leaseName := operation.LockNameForPVC(cfg.PVCName)
+	setProgressPhase(cfg, liveprogress.LockAcquiring, fmt.Sprintf("acquiring operation Lease %s/%s", namespace, leaseName))
+	lock, err := operation.AcquireLease(ctx, client, namespace, cfg.PVCName, holder, func(observation operation.LeaseObservation) {
+		switch {
+		case observation.Waiting:
+			setProgressPhase(cfg, liveprogress.LockWaiting, fmt.Sprintf("Lease %s/%s is held by %s resourceVersion=%s", namespace, observation.Name, observation.Holder, observation.ResourceVersion))
+		case observation.Acquired:
+			setProgressPhase(cfg, liveprogress.LockAcquiring, fmt.Sprintf("Lease %s/%s acquired by this invocation", namespace, observation.Name))
+		}
+	})
 	if err != nil {
 		return err
 	}
 	defer func() {
+		setProgressPhase(cfg, liveprogress.CleanupLease, fmt.Sprintf("releasing operation Lease %s/%s", namespace, leaseName))
 		releaseCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		retErr = errors.Join(retErr, lock.Release(releaseCtx))
+		releaseErr := lock.Release(releaseCtx)
+		if releaseErr == nil {
+			progressActivity(cfg, fmt.Sprintf("operation Lease %s/%s released", namespace, leaseName))
+		}
+		retErr = errors.Join(retErr, releaseErr)
 	}()
 	return fn(lock.Context())
 }
@@ -535,28 +606,29 @@ func validateConsumers(plan *kube.ConsumerPlan, manual bool) error {
 }
 
 func printPlan(cfg Config, namespace string, source *corev1.PersistentVolumeClaim, target resource.Quantity, plan *kube.ConsumerPlan) {
-	out := cfg.IOStreams.Out
+	var out strings.Builder
 	current := pvcmanifest.CurrentSize(source)
-	fmt.Fprintln(out, "PVC shrink plan")
-	fmt.Fprintf(out, "  Source:           %s/%s\n", namespace, cfg.PVCName)
-	fmt.Fprintf(out, "  Current size:     %s\n", current.String())
-	fmt.Fprintf(out, "  Target size:      %s\n", target.String())
-	fmt.Fprintf(out, "  Temporary PVC:    %s/%s\n", namespace, cfg.TempName)
-	fmt.Fprintf(out, "  Scale consumers:  %t\n", !cfg.NoScale)
-	fmt.Fprintf(out, "  Safety margin:    %d%%\n", cfg.SafetyMarginPercent)
+	fmt.Fprintln(&out, "PVC shrink plan")
+	fmt.Fprintf(&out, "  Source:           %s/%s\n", namespace, cfg.PVCName)
+	fmt.Fprintf(&out, "  Current size:     %s\n", current.String())
+	fmt.Fprintf(&out, "  Target size:      %s\n", target.String())
+	fmt.Fprintf(&out, "  Temporary PVC:    %s/%s\n", namespace, cfg.TempName)
+	fmt.Fprintf(&out, "  Scale consumers:  %t\n", !cfg.NoScale)
+	fmt.Fprintf(&out, "  Safety margin:    %d%%\n", cfg.SafetyMarginPercent)
 	if len(plan.Pods) > 0 {
-		fmt.Fprintf(out, "  Active pods:      %s\n", strings.Join(plan.Pods, ", "))
+		fmt.Fprintf(&out, "  Active pods:      %s\n", strings.Join(plan.Pods, ", "))
 	}
 	for _, dep := range plan.Deployments {
-		fmt.Fprintf(out, "  Deployment:       %s/%s replicas=%d\n", dep.Namespace, dep.Name, dep.Replicas)
+		fmt.Fprintf(&out, "  Deployment:       %s/%s replicas=%d\n", dep.Namespace, dep.Name, dep.Replicas)
 	}
 	for _, c := range plan.Unsupported {
-		fmt.Fprintf(out, "  Unsupported:      %s/%s via pod %s\n", c.Kind, c.Name, c.Pod)
+		fmt.Fprintf(&out, "  Unsupported:      %s/%s via pod %s\n", c.Kind, c.Name, c.Pod)
 	}
+	durableOutput(cfg, cfg.IOStreams.Out, out.String())
 }
 
 func confirm(cfg Config) error {
-	fmt.Fprint(cfg.IOStreams.Out, "\nContinue? Type 'yes' to proceed: ")
+	durableOutput(cfg, cfg.IOStreams.Out, "\nContinue? Type 'yes' to proceed: ")
 	scanner := bufio.NewScanner(cfg.IOStreams.In)
 	if scanner.Scan() && strings.EqualFold(strings.TrimSpace(scanner.Text()), "yes") {
 		return nil

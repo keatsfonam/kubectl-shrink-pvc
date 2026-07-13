@@ -41,6 +41,19 @@ func TestLeaseLockSerializesAndReleases(t *testing.T) {
 	}
 }
 
+func TestLeaseObserverPanicCannotChangeOwnershipResult(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	lock, err := AcquireLease(context.Background(), client, "ns", "data", "holder", func(LeaseObservation) {
+		panic("render failed")
+	})
+	if err != nil {
+		t.Fatalf("observer changed acquisition result: %v", err)
+	}
+	if err := lock.Release(context.Background()); err != nil {
+		t.Fatalf("observer changed release result: %v", err)
+	}
+}
+
 func TestLeaseLockReleaseDoesNotDeleteNewOwner(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	lock, err := AcquireLease(context.Background(), client, "ns", "data", "first")

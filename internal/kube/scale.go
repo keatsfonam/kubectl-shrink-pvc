@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -72,7 +73,20 @@ func RestoreDeployments(ctx context.Context, client kubernetes.Interface, deps [
 	return restoreDeploymentSet(ctx, client, deps)
 }
 
-func WaitForPVCUnmounted(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, timeout, poll time.Duration) error {
+type PVCUnmountObservation struct {
+	ActivePods []string
+}
+
+type PVCDeletionObservation struct {
+	Exists bool
+	UID    types.UID
+	Phase  corev1.PersistentVolumeClaimPhase
+}
+
+type PVCUnmountObserver func(PVCUnmountObservation)
+type PVCDeletionObserver func(PVCDeletionObservation)
+
+func WaitForPVCUnmounted(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, timeout, poll time.Duration, observers ...PVCUnmountObserver) error {
 	var holdouts []string
 	err := wait.PollUntilContextTimeout(ctx, poll, timeout, true, func(ctx context.Context) (bool, error) {
 		pods, err := ActivePodsUsingPVC(ctx, client, namespace, pvcName)
@@ -80,6 +94,7 @@ func WaitForPVCUnmounted(ctx context.Context, client kubernetes.Interface, names
 			return false, err
 		}
 		holdouts = pods
+		notifyPVCUnmountObservers(observers, PVCUnmountObservation{ActivePods: append([]string(nil), pods...)})
 		return len(pods) == 0, nil
 	})
 	if wait.Interrupted(err) && ctx.Err() == nil {
@@ -88,15 +103,17 @@ func WaitForPVCUnmounted(ctx context.Context, client kubernetes.Interface, names
 	return err
 }
 
-func WaitForPVCDeleted(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, expectedUID types.UID, timeout, poll time.Duration) error {
+func WaitForPVCDeleted(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, expectedUID types.UID, timeout, poll time.Duration, observers ...PVCDeletionObserver) error {
 	err := wait.PollUntilContextTimeout(ctx, poll, timeout, true, func(ctx context.Context) (bool, error) {
 		pvc, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
+			notifyPVCDeletionObservers(observers, PVCDeletionObservation{})
 			return true, nil
 		}
 		if err != nil {
 			return false, fmt.Errorf("get PVC while waiting for deletion: %w", err)
 		}
+		notifyPVCDeletionObservers(observers, PVCDeletionObservation{Exists: true, UID: pvc.UID, Phase: pvc.Status.Phase})
 		if expectedUID != "" && pvc.UID != expectedUID {
 			return false, fmt.Errorf("PVC %s/%s was replaced while waiting for deletion: expected UID %s, found %s", namespace, pvcName, expectedUID, pvc.UID)
 		}
@@ -106,4 +123,28 @@ func WaitForPVCDeleted(ctx context.Context, client kubernetes.Interface, namespa
 		return fmt.Errorf("timed out waiting for PVC %s/%s deletion", namespace, pvcName)
 	}
 	return err
+}
+
+func notifyPVCUnmountObservers(observers []PVCUnmountObserver, observation PVCUnmountObservation) {
+	for _, observer := range observers {
+		if observer == nil {
+			continue
+		}
+		func() {
+			defer func() { _ = recover() }()
+			observer(observation)
+		}()
+	}
+}
+
+func notifyPVCDeletionObservers(observers []PVCDeletionObserver, observation PVCDeletionObservation) {
+	for _, observer := range observers {
+		if observer == nil {
+			continue
+		}
+		func() {
+			defer func() { _ = recover() }()
+			observer(observation)
+		}()
+	}
 }
