@@ -104,6 +104,18 @@ want=$(seed data)
 [[ $(pvc_size data) == 1Gi ]] || fail "dry run resized the PVC"
 kubectl -n $ns get pvc data-shrink-tmp >/dev/null 2>&1 && fail "dry run created a temp PVC"
 
+echo "=== copy failure preserves source and restores workload"
+workload failcopy 0
+fail_want=$(seed failcopy)
+if out=$("$bin" failcopy --size 512Mi -n $ns --yes --image alpine:3.20 2>&1); then
+	fail "expected copy failure, got success"
+fi
+kubectl -n $ns rollout status deploy/app-failcopy --timeout=180s
+[[ $(pvc_size failcopy) == 1Gi ]] || fail "copy failure changed source PVC size"
+fail_got=$(checksum failcopy)
+[[ $fail_got == "$fail_want" ]] || fail "copy failure changed source data: $fail_got != $fail_want"
+kubectl -n $ns get configmap failcopy-shrink-state >/dev/null 2>&1 && fail "copy failure persisted destructive state"
+
 echo "=== full replace as root"
 "$bin" data --size 512Mi -n $ns --yes
 kubectl -n $ns rollout status deploy/app-data --timeout=180s

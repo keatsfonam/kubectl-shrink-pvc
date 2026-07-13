@@ -10,8 +10,41 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/kube"
 	"github.com/keatsfonam/kubectl-shrink-pvc/internal/operation"
 )
+
+func TestValidateDestructiveBoundaryRejectsReplacement(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "ns", UID: "replacement"}})
+	err := validateDestructiveBoundary(context.Background(), client, "ns", "data", "original", nil, true)
+	if err == nil || !strings.Contains(err.Error(), "was replaced") {
+		t.Fatalf("expected replacement error, got %v", err)
+	}
+}
+
+func TestValidateDestructiveBoundaryRejectsNewPod(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "ns", UID: "uid"}},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "late-pod", Namespace: "ns"},
+			Spec:       corev1.PodSpec{Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}}}}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		},
+	)
+	err := validateDestructiveBoundary(context.Background(), client, "ns", "data", "uid", nil, true)
+	if err == nil || !strings.Contains(err.Error(), "gained active consumers") {
+		t.Fatalf("expected active consumer error, got %v", err)
+	}
+}
+
+func TestRevalidateExecutionPlanRejectsChangedSourceUID(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "ns", UID: "new"}})
+	approvedSource := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "ns", UID: "old"}}
+	_, _, err := revalidateExecutionPlan(context.Background(), client, "ns", "data", approvedSource, &kube.ConsumerPlan{}, true)
+	if err == nil || !strings.Contains(err.Error(), "was replaced after planning") {
+		t.Fatalf("expected source replacement error, got %v", err)
+	}
+}
 
 func TestResumeRejectsChangedTarget(t *testing.T) {
 	client := fake.NewSimpleClientset()
