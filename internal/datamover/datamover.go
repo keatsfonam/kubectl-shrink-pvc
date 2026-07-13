@@ -44,7 +44,7 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 	nonRoot := req.RunAsUser >= 0
 	args := rsyncArgs(req.Args, nonRoot)
 
-	job := buildJob(req, runName, args, nonRoot, backoff)
+	job := buildJob(req, runName, args, nonRoot, backoff, false)
 
 	if _, err := m.Client.BatchV1().Jobs(req.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create rsync job: %w", err)
@@ -69,7 +69,7 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 	return nil
 }
 
-func buildJob(req Request, runName string, args []string, nonRoot bool, backoff int32) *batchv1.Job {
+func buildJob(req Request, runName string, args []string, nonRoot bool, backoff int32, destReadOnly bool) *batchv1.Job {
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: runName, Namespace: req.Namespace},
 		Spec: batchv1.JobSpec{
@@ -88,17 +88,55 @@ func buildJob(req Request, runName string, args []string, nonRoot bool, backoff 
 						SecurityContext: podsec.Container(nonRoot, "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "MKNOD"),
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "source", MountPath: "/src", ReadOnly: true},
-							{Name: "dest", MountPath: "/dest"},
+							{Name: "dest", MountPath: "/dest", ReadOnly: destReadOnly},
 						},
 					}},
 					Volumes: []corev1.Volume{
 						{Name: "source", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: req.SourcePVC, ReadOnly: true}}},
-						{Name: "dest", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: req.DestPVC}}},
+						{Name: "dest", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: req.DestPVC, ReadOnly: destReadOnly}}},
 					},
 				},
 			},
 		},
 	}
+}
+
+func (m RsyncMover) Verify(ctx context.Context, req Request) error {
+	runName := uniqueName(req.JobName + "-verify")
+	backoff := int32(0)
+	nonRoot := req.RunAsUser >= 0
+	job := buildJob(req, runName, verifyArgs(), nonRoot, backoff, true)
+	if _, err := m.Client.BatchV1().Jobs(req.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create rsync verification job: %w", err)
+	}
+	cleaned := false
+	defer func() {
+		if cleaned {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), req.WaitTimeout)
+		defer cancel()
+		_ = cleanupJob(cleanupCtx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval)
+	}()
+	if err := waitForJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval); err != nil {
+		return fmt.Errorf("verify copied data: %w", err)
+	}
+	logs, err := jobLogs(ctx, m.Client, req.Namespace, runName)
+	if err != nil {
+		return fmt.Errorf("read verification logs: %w", err)
+	}
+	if err := cleanupJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval); err != nil {
+		return err
+	}
+	cleaned = true
+	if differences := strings.TrimSpace(logs); differences != "" {
+		return fmt.Errorf("copy verification found differences:\n%s", differences)
+	}
+	return nil
+}
+
+func verifyArgs() []string {
+	return []string{"-rltnciO", "--checksum", "--exclude=lost+found", "--delete", "--itemize-changes", "--out-format=%i %n%L", "/src/", "/dest/"}
 }
 
 func rsyncArgs(extraArgs []string, nonRoot bool) []string {

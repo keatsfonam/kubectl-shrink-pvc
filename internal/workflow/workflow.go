@@ -213,12 +213,17 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 
 	mover := datamover.RsyncMover{Client: client}
 	fmt.Fprintf(cfg.IOStreams.Out, "Copying %s -> %s...\n", cfg.PVCName, cfg.TempName)
-	if err := mover.Move(ctx, datamover.Request{
+	copyToTemp := datamover.Request{
 		Namespace: namespace, SourcePVC: cfg.PVCName, DestPVC: cfg.TempName, Image: cfg.Image,
 		JobName: naming.SafeDNSLabel("shrink-copy-to-temp-" + cfg.PVCName), Args: cfg.RsyncArgs,
 		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
 		WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
-	}); err != nil {
+	}
+	if err := mover.Move(ctx, copyToTemp); err != nil {
+		return err
+	}
+	fmt.Fprintln(cfg.IOStreams.Out, "Verifying temporary copy...")
+	if err := mover.Verify(ctx, copyToTemp); err != nil {
 		return err
 	}
 
@@ -274,12 +279,17 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	}
 
 	fmt.Fprintf(cfg.IOStreams.Out, "Copying %s -> %s...\n", cfg.TempName, cfg.PVCName)
-	if err := mover.Move(ctx, datamover.Request{
+	copyBack := datamover.Request{
 		Namespace: namespace, SourcePVC: cfg.TempName, DestPVC: cfg.PVCName, Image: cfg.Image,
 		JobName: naming.SafeDNSLabel("shrink-copy-back-" + cfg.PVCName), Args: cfg.RsyncArgs,
 		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
 		WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
-	}); err != nil {
+	}
+	if err := mover.Move(ctx, copyBack); err != nil {
+		return err
+	}
+	fmt.Fprintln(cfg.IOStreams.Out, "Verifying restored copy...")
+	if err := mover.Verify(ctx, copyBack); err != nil {
 		return err
 	}
 	restoreOnExit = true

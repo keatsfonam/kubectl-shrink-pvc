@@ -77,12 +77,12 @@ The tool runs in phases:
 6. Wait until the PVC is unmounted.
 7. Run an inspection pod that mounts the source PVC read-only and measures usage with `du`.
 8. Create a temporary PVC at the target size.
-9. Copy source PVC data to the temporary PVC with rsync.
+9. Copy source PVC data to the temporary PVC and verify it with a checksum dry-run.
 10. Persist recovery state in a ConfigMap before deleting the original PVC.
-11. Delete and recreate the original PVC at the new size, then copy the data back.
+11. Delete and recreate the original PVC at the new size, copy the data back, and verify it again.
 12. Restore Deployment replica counts and remove the recovery state.
 
-The inspection step catches obvious "data cannot fit" cases before migration. By default, the measured usage must fit with a 10% safety margin (`--safety-margin`) to leave room for destination filesystem overhead. Rsync and the destination filesystem remain authoritative; sparse files, filesystem overhead, or unusual metadata can still cause the copy to fail. Copy failures before the original PVC is deleted leave it untouched.
+The inspection step catches obvious "data cannot fit" cases before migration. By default, the measured usage must fit with a 10% safety margin (`--safety-margin`) to leave room for destination filesystem overhead. Rsync and the destination filesystem remain authoritative; sparse files, filesystem overhead, or unusual metadata can still cause the copy to fail. Each copy is followed by a read-only checksum dry-run, and recovery data is retained if verification fails. Copy or verification failures before the original PVC is deleted leave it untouched.
 
 ## Recovery notes
 

@@ -121,12 +121,16 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 			return err
 		}
 		fmt.Fprintf(cfg.IOStreams.Out, "Resuming copy %s -> %s...\n", state.TempName, state.SourceName)
-		if err := mover.Move(ctx, datamover.Request{
+		copyBack := datamover.Request{
 			Namespace: namespace, SourcePVC: state.TempName, DestPVC: state.SourceName, Image: state.Image,
 			JobName: naming.SafeDNSLabel("shrink-copy-back-" + state.SourceName), Args: state.RsyncArgs,
 			RunAsUser: state.RunAsUser, FSGroup: state.FSGroup,
 			WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
-		}); err != nil {
+		}
+		if err := mover.Move(ctx, copyBack); err != nil {
+			return err
+		}
+		if err := mover.Verify(ctx, copyBack); err != nil {
 			return err
 		}
 		if err := updatePhase(operation.PhaseCopiedBack); err != nil {
