@@ -21,6 +21,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["replicationcontrollers"]
+    verbs: ["list"]
   # Durable operation checkpoints.
   - apiGroups: [""]
     resources: ["configmaps"]

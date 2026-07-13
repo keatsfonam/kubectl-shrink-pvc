@@ -2,7 +2,8 @@ package pvcmanifest
 
 import (
 	"fmt"
-	"strings"
+
+	"github.com/keatsfonam/kubectl-shrink-pvc/internal/naming"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -55,16 +56,7 @@ func Build(source *corev1.PersistentVolumeClaim, name string, target resource.Qu
 }
 
 func TempName(sourceName string) string {
-	const suffix = "shrink-tmp"
-	base := sourceName + "-" + suffix
-	if len(base) <= 63 {
-		return base
-	}
-	trim := 63 - len(suffix) - 1
-	if trim < 1 {
-		trim = 1
-	}
-	return strings.TrimRight(sourceName[:trim], "-") + "-" + suffix
+	return naming.SafeDNSLabel(sourceName + "-shrink-tmp")
 }
 
 func copyStringMap(in map[string]string) map[string]string {

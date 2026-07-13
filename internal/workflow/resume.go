@@ -142,10 +142,10 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 			if err := validateDestructiveBoundary(ctx, client, namespace, state.SourceName, state.OriginalSourceUID, state.Deployments, state.NoScale); err != nil {
 				return err
 			}
+			restoreOnExit = false
 			if err := updatePhase(operation.PhaseSourceDeleteRequested); err != nil {
 				return err
 			}
-			restoreOnExit = false
 			if err := kube.DeletePVC(ctx, client, namespace, state.SourceName, state.OriginalSourceUID); err != nil {
 				return err
 			}

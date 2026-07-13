@@ -78,7 +78,7 @@ The tool runs in phases:
 
 1. Validate the source PVC and target size.
 2. Discover live pods and built-in controller templates that reference the PVC.
-3. Refuse unsupported consumers such as StatefulSets, DaemonSets, Jobs, CronJobs, and standalone ReplicaSets in v1.
+3. Refuse unsupported consumers such as ReplicationControllers, StatefulSets, DaemonSets, Jobs, CronJobs, and standalone ReplicaSets in v1.
 4. Print the plan and wait for confirmation unless `--yes` is set.
 5. Acquire a renewable per-PVC Lease, durably checkpoint the approved source/Deployment UIDs and original replica counts, then scale Deployment consumers to zero unless `--no-scale` is set.
 6. Wait until the PVC is unmounted.
@@ -111,7 +111,11 @@ Each release publishes `checksums.txt`, a keyless Sigstore bundle for it, and Gi
 
 ```sh
 sha256sum --check --ignore-missing checksums.txt
-cosign verify-blob --bundle checksums.txt.bundle checksums.txt
+cosign verify-blob \
+  --bundle checksums.txt.bundle \
+  --certificate-identity-regexp='^https://github.com/keatsfonam/kubectl-shrink-pvc/.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+  --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+  checksums.txt
 gh attestation verify kubectl-shrink-pvc_v0.5.0_linux_amd64.tar.gz \
   --repo keatsfonam/kubectl-shrink-pvc
 ```

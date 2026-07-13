@@ -72,6 +72,17 @@ func DiscoverConsumers(ctx context.Context, client kubernetes.Interface, namespa
 		}
 	}
 
+	replicationControllers, err := client.CoreV1().ReplicationControllers(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list ReplicationControllers: %w", err)
+	}
+	for i := range replicationControllers.Items {
+		rc := &replicationControllers.Items[i]
+		if rc.Spec.Template != nil && templateUsesPVC(&rc.Spec.Template.Spec, pvcName) {
+			addUnsupported("ReplicationController", rc.Name, "")
+		}
+	}
+
 	deps, err := client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("list Deployments: %w", err)

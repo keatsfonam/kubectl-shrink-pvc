@@ -1,11 +1,13 @@
 package pvcmanifest
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 func TestBuildSanitizesPVC(t *testing.T) {
@@ -68,5 +70,15 @@ func TestTempNameTruncates(t *testing.T) {
 	}
 	if got == "" {
 		t.Fatal("expected non-empty name")
+	}
+}
+
+func TestTempNameHandlesLongDottedSource(t *testing.T) {
+	got := TempName(strings.Repeat("a", 51) + ".b")
+	if problems := validation.IsDNS1123Subdomain(got); len(problems) > 0 {
+		t.Fatalf("TempName returned invalid DNS subdomain %q: %v", got, problems)
+	}
+	if len(got) > 63 {
+		t.Fatalf("name too long: %d", len(got))
 	}
 }

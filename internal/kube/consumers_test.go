@@ -37,7 +37,9 @@ func TestDiscoverConsumersResolvesDeployment(t *testing.T) {
 func TestDiscoverConsumersFindsControllerTemplatesWithoutPods(t *testing.T) {
 	replicas := int32(0)
 	template := func() corev1.PodTemplateSpec { return corev1.PodTemplateSpec{Spec: pod("", "", "data", nil).Spec} }
+	rcTemplate := template()
 	client := fake.NewSimpleClientset(
+		&corev1.ReplicationController{ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "ns"}, Spec: corev1.ReplicationControllerSpec{Replicas: &replicas, Template: &rcTemplate}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "ns", UID: "web-uid"}, Spec: appsv1.DeploymentSpec{Replicas: &replicas, Template: template()}},
 		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "ns"}, Spec: appsv1.StatefulSetSpec{Template: template()}},
 		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "ns"}, Spec: appsv1.DaemonSetSpec{Template: template()}},
@@ -56,7 +58,7 @@ func TestDiscoverConsumersFindsControllerTemplatesWithoutPods(t *testing.T) {
 	for _, item := range plan.Unsupported {
 		got[item.Kind+"/"+item.Name] = true
 	}
-	for _, want := range []string{"StatefulSet/db", "DaemonSet/agent", "ReplicaSet/standalone", "Job/job", "CronJob/cron"} {
+	for _, want := range []string{"ReplicationController/legacy", "StatefulSet/db", "DaemonSet/agent", "ReplicaSet/standalone", "Job/job", "CronJob/cron"} {
 		if !got[want] {
 			t.Errorf("missing template consumer %s in %#v", want, plan.Unsupported)
 		}
