@@ -140,7 +140,7 @@ func verifyArgs(copyArgs []string, nonRoot bool) []string {
 	if nonRoot {
 		args = []string{"-rlHtniO", "--checksum"}
 	}
-	args = append(args, "--exclude=lost+found", "--delete", "--itemize-changes", "--out-format=%i %n%L")
+	args = append(args, "--exclude=lost+found", "--delete", "--itemize-changes")
 	for _, arg := range copyArgs {
 		if isRsyncSelectionArg(arg) {
 			args = append(args, arg)

@@ -2,6 +2,7 @@ package datamover
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -74,6 +75,9 @@ func TestVerifyArgs(t *testing.T) {
 	for _, arg := range got {
 		if arg == "--bwlimit=10m" {
 			t.Fatal("non-selection copy option must not alter verification")
+		}
+		if strings.HasPrefix(arg, "--out-format") {
+			t.Fatal("custom out-format reports unchanged files as verification differences")
 		}
 	}
 }
