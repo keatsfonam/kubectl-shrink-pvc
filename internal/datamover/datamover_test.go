@@ -1,9 +1,21 @@
 package datamover
 
 import (
+	"context"
+	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func TestJobDisablesServiceAccountToken(t *testing.T) {
@@ -56,18 +68,31 @@ func TestVerificationJobMountsBothPVCsReadOnly(t *testing.T) {
 	}
 }
 
-func TestVerificationDifferencesIgnoresUnchangedEntries(t *testing.T) {
-	logs := ".f          files/blob1\n.d          files\n"
-	if got := verificationDifferences(logs); got != "" {
-		t.Fatalf("unchanged entries reported as differences: %q", got)
+func TestVerificationDifferencesNoChanges(t *testing.T) {
+	logs := "Number of files: 2\ntotal size is 42  speedup is 1.00 (DRY RUN)\n"
+	got, err := verificationDifferences(logs)
+	if err != nil || got != "" {
+		t.Fatalf("verificationDifferences() = %q, %v", got, err)
 	}
 }
 
 func TestVerificationDifferencesReportsChanges(t *testing.T) {
-	logs := ".f          files/unchanged\n>fc........ files/changed\n*deleting   files/extra\n"
+	logs := verificationRecordPrefix + ">fc........ files/changed\n" + verificationRecordPrefix + "*deleting   files/extra\ntotal size is 42  speedup is 1.00 (DRY RUN)\n"
 	want := ">fc........ files/changed\n*deleting   files/extra"
-	if got := verificationDifferences(logs); got != want {
-		t.Fatalf("got %q, want %q", got, want)
+	got, err := verificationDifferences(logs)
+	if err != nil || got != want {
+		t.Fatalf("verificationDifferences() = %q, %v; want %q", got, err, want)
+	}
+}
+
+func TestVerificationDifferencesRequiresCompletionSentinel(t *testing.T) {
+	if got, err := verificationDifferences(verificationRecordPrefix + ">fc........ files/changed\n"); err == nil || got != "" {
+		t.Fatalf("verificationDifferences() = %q, %v; want missing-sentinel error", got, err)
+	}
+	for _, invalid := range []string{"total size is forged", "total size is 1 speedup is nope", "not total size is 1 speedup is 1"} {
+		if isVerificationSentinel(invalid) {
+			t.Fatalf("accepted invalid sentinel %q", invalid)
+		}
 	}
 }
 
@@ -87,13 +112,17 @@ func TestVerifyArgs(t *testing.T) {
 			t.Fatalf("verification args missing %s: %#v", required, got)
 		}
 	}
+	foundProtocolFormat := false
 	for _, arg := range got {
 		if arg == "--bwlimit=10m" {
 			t.Fatal("non-selection copy option must not alter verification")
 		}
-		if strings.HasPrefix(arg, "--out-format") {
-			t.Fatal("custom out-format reports unchanged files as verification differences")
+		if arg == "--out-format="+verificationRecordPrefix+"%i %n%L" {
+			foundProtocolFormat = true
 		}
+	}
+	if !foundProtocolFormat {
+		t.Fatal("verification args must use the reserved record prefix")
 	}
 }
 
@@ -113,3 +142,162 @@ func TestUniqueNameFitsDNSLabel(t *testing.T) {
 		t.Fatal("uniqueName returned empty string")
 	}
 }
+
+func TestVerifySuccess(t *testing.T) {
+	mover, client := verifyTestMover(t, batchv1.JobComplete, true, "Number of files: 1\ntotal size is 5  speedup is 1.00 (DRY RUN)\n", nil)
+	if err := mover.Verify(context.Background(), verifyTestRequest()); err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	assertNoJobsOrPods(t, client)
+}
+
+func TestVerifyDifferences(t *testing.T) {
+	logs := verificationRecordPrefix + ">fc........ changed\nNumber of files: 1\ntotal size is 5  speedup is 1.00 (DRY RUN)\n"
+	mover, client := verifyTestMover(t, batchv1.JobComplete, true, logs, nil)
+	err := mover.Verify(context.Background(), verifyTestRequest())
+	if err == nil || !strings.Contains(err.Error(), ">fc........ changed") {
+		t.Fatalf("Verify() error = %v, want reported difference", err)
+	}
+	assertNoJobsOrPods(t, client)
+}
+
+func TestVerifyFailsClosedWithoutPods(t *testing.T) {
+	mover, _ := verifyTestMover(t, batchv1.JobComplete, false, "", nil)
+	if err := mover.Verify(context.Background(), verifyTestRequest()); err == nil || !strings.Contains(err.Error(), "no rsync job pods") {
+		t.Fatalf("Verify() error = %v", err)
+	}
+}
+
+func TestVerifyFailsClosedWithoutCompletionSentinel(t *testing.T) {
+	mover, _ := verifyTestMover(t, batchv1.JobComplete, true, "", nil)
+	if err := mover.Verify(context.Background(), verifyTestRequest()); err == nil || !strings.Contains(err.Error(), "completion sentinel not found") {
+		t.Fatalf("Verify() error = %v", err)
+	}
+}
+
+func TestVerifyFailsClosedOnPodListError(t *testing.T) {
+	mover, client := verifyTestMover(t, batchv1.JobComplete, true, "", nil)
+	client.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("pods forbidden")
+	})
+	if err := mover.Verify(context.Background(), verifyTestRequest()); err == nil || !strings.Contains(err.Error(), "pods forbidden") {
+		t.Fatalf("Verify() error = %v", err)
+	}
+}
+
+func TestVerifyFailsClosedOnLogOpenError(t *testing.T) {
+	mover, _ := verifyTestMover(t, batchv1.JobComplete, true, "", errors.New("logs forbidden"))
+	if err := mover.Verify(context.Background(), verifyTestRequest()); err == nil || !strings.Contains(err.Error(), "logs forbidden") {
+		t.Fatalf("Verify() error = %v", err)
+	}
+}
+
+func TestVerifyFailsClosedOnLogReadError(t *testing.T) {
+	mover, _ := verifyTestMover(t, batchv1.JobComplete, true, "", nil)
+	mover.readLogs = func(context.Context, string, string, *corev1.PodLogOptions) (io.ReadCloser, error) {
+		return &errorReadCloser{readErr: errors.New("broken stream")}, nil
+	}
+	if err := mover.Verify(context.Background(), verifyTestRequest()); err == nil || !strings.Contains(err.Error(), "broken stream") {
+		t.Fatalf("Verify() error = %v", err)
+	}
+}
+
+func TestVerifyFailsClosedOnOversizedLogs(t *testing.T) {
+	mover, _ := verifyTestMover(t, batchv1.JobComplete, true, strings.Repeat("x", maxJobLogBytes+1), nil)
+	if err := mover.Verify(context.Background(), verifyTestRequest()); err == nil || !strings.Contains(err.Error(), "exceed") {
+		t.Fatalf("Verify() error = %v", err)
+	}
+}
+
+func TestVerifyJobFailureIncludesLogsAndCleansUp(t *testing.T) {
+	mover, client := verifyTestMover(t, batchv1.JobFailed, true, "rsync: permission denied", nil)
+	err := mover.Verify(context.Background(), verifyTestRequest())
+	if err == nil || !strings.Contains(err.Error(), "permission denied") || !strings.Contains(err.Error(), "job failed") {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	assertNoJobsOrPods(t, client)
+}
+
+func TestVerifyCleanupFailure(t *testing.T) {
+	mover, client := verifyTestMover(t, batchv1.JobComplete, true, "total size is 0  speedup is 1.00 (DRY RUN)", nil)
+	client.PrependReactor("delete", "jobs", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("delete forbidden")
+	})
+	if err := mover.Verify(context.Background(), verifyTestRequest()); err == nil || !strings.Contains(err.Error(), "delete forbidden") {
+		t.Fatalf("Verify() error = %v", err)
+	}
+}
+
+func verifyTestRequest() Request {
+	return Request{
+		Namespace: "ns", SourcePVC: "source", DestPVC: "dest", Image: "image", JobName: "test",
+		RunAsUser: -1, FSGroup: -1, WaitTimeout: 100 * time.Millisecond, PollInterval: time.Millisecond,
+	}
+}
+
+func verifyTestMover(t *testing.T, condition batchv1.JobConditionType, createPod bool, logs string, logErr error) (RsyncMover, *fake.Clientset) {
+	t.Helper()
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("delete-collection", "pods", func(action ktesting.Action) (bool, runtime.Object, error) {
+		namespace := action.GetNamespace()
+		objects, err := client.Tracker().List(schema.GroupVersionResource{Version: "v1", Resource: "pods"}, schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, namespace)
+		if err != nil {
+			return true, nil, err
+		}
+		for _, pod := range objects.(*corev1.PodList).Items {
+			if err := client.Tracker().Delete(schema.GroupVersionResource{Version: "v1", Resource: "pods"}, namespace, pod.Name); err != nil {
+				return true, nil, err
+			}
+		}
+		return true, nil, nil
+	})
+	client.PrependReactor("create", "jobs", func(action ktesting.Action) (bool, runtime.Object, error) {
+		job := action.(ktesting.CreateAction).GetObject().(*batchv1.Job)
+		if createPod {
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: "verify-pod", Namespace: job.Namespace,
+				Labels: map[string]string{"shrink-pvc-job": job.Name},
+			}}
+			if err := client.Tracker().Create(schema.GroupVersionResource{Version: "v1", Resource: "pods"}, pod, job.Namespace); err != nil {
+				return true, nil, err
+			}
+		}
+		return false, nil, nil
+	})
+	client.PrependReactor("get", "jobs", func(action ktesting.Action) (bool, runtime.Object, error) {
+		get := action.(ktesting.GetAction)
+		obj, err := client.Tracker().Get(schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "jobs"}, get.GetNamespace(), get.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		job := obj.(*batchv1.Job).DeepCopy()
+		job.Status.Conditions = []batchv1.JobCondition{{Type: condition, Status: corev1.ConditionTrue, Message: "test condition"}}
+		return true, job, nil
+	})
+	mover := RsyncMover{Client: client, readLogs: func(context.Context, string, string, *corev1.PodLogOptions) (io.ReadCloser, error) {
+		if logErr != nil {
+			return nil, logErr
+		}
+		return io.NopCloser(strings.NewReader(logs)), nil
+	}}
+	return mover, client
+}
+
+func assertNoJobsOrPods(t *testing.T, client *fake.Clientset) {
+	t.Helper()
+	jobs, err := client.BatchV1().Jobs("ns").List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(jobs.Items) != 0 {
+		t.Fatalf("jobs after Verify = %d, %v", len(jobs.Items), err)
+	}
+	pods, err := client.CoreV1().Pods("ns").List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(pods.Items) != 0 {
+		t.Fatalf("pods after Verify = %d, %v", len(pods.Items), err)
+	}
+}
+
+type errorReadCloser struct {
+	readErr error
+}
+
+func (r *errorReadCloser) Read([]byte) (int, error) { return 0, r.readErr }
+func (r *errorReadCloser) Close() error             { return nil }

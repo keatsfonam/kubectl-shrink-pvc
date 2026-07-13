@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,12 @@ import (
 
 const DefaultImage = "instrumentisto/rsync-ssh:alpine3.23-r3@sha256:6cbad37c2fbdca4ac7ad9d1c1bb8990af9efd4dc76321b349935876cbb1e9e4a"
 
+const (
+	maxJobLogBytes             = 1 << 20
+	verificationRecordPrefix   = "KSP_VERIFY_RECORD "
+	verificationSentinelPrefix = "total size is "
+)
+
 type Request struct {
 	Namespace    string
 	SourcePVC    string
@@ -35,8 +42,11 @@ type Request struct {
 }
 
 type RsyncMover struct {
-	Client kubernetes.Interface
+	Client   kubernetes.Interface
+	readLogs podLogReader
 }
+
+type podLogReader func(context.Context, string, string, *corev1.PodLogOptions) (io.ReadCloser, error)
 
 func (m RsyncMover) Move(ctx context.Context, req Request) error {
 	runName := uniqueName(req.JobName)
@@ -56,7 +66,7 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 		// broken API server cannot hang the exit path.
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), req.WaitTimeout)
 		defer cancel()
-		logs, _ := jobLogs(cleanupCtx, m.Client, req.Namespace, runName)
+		logs, _ := jobLogs(cleanupCtx, m.Client, m.readLogs, req.Namespace, runName)
 		_ = cleanupJob(cleanupCtx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval)
 		if logs != "" {
 			return fmt.Errorf("%w; logs: %s", err, logs)
@@ -106,6 +116,7 @@ func (m RsyncMover) Verify(ctx context.Context, req Request) error {
 	backoff := int32(0)
 	nonRoot := req.RunAsUser >= 0
 	job := buildJob(req, runName, verifyArgs(req.Args, nonRoot), nonRoot, backoff, true)
+	job.Spec.Template.Spec.Containers[0].Env = append(job.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{Name: "LC_ALL", Value: "C"})
 	if _, err := m.Client.BatchV1().Jobs(req.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create rsync verification job: %w", err)
 	}
@@ -119,9 +130,18 @@ func (m RsyncMover) Verify(ctx context.Context, req Request) error {
 		_ = cleanupJob(cleanupCtx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval)
 	}()
 	if err := waitForJob(ctx, m.Client, req.Namespace, runName, req.WaitTimeout, req.PollInterval); err != nil {
+		failureCtx, cancel := context.WithTimeout(context.Background(), req.WaitTimeout)
+		defer cancel()
+		logs, logErr := jobLogs(failureCtx, m.Client, m.readLogs, req.Namespace, runName)
+		if logErr == nil && logs != "" {
+			return fmt.Errorf("verify copied data: %w; logs: %s", err, logs)
+		}
+		if logErr != nil {
+			return fmt.Errorf("verify copied data: %w; read verification logs: %v", err, logErr)
+		}
 		return fmt.Errorf("verify copied data: %w", err)
 	}
-	logs, err := jobLogs(ctx, m.Client, req.Namespace, runName)
+	logs, err := jobLogs(ctx, m.Client, m.readLogs, req.Namespace, runName)
 	if err != nil {
 		return fmt.Errorf("read verification logs: %w", err)
 	}
@@ -129,37 +149,53 @@ func (m RsyncMover) Verify(ctx context.Context, req Request) error {
 		return err
 	}
 	cleaned = true
-	if differences := verificationDifferences(logs); differences != "" {
+	differences, err := verificationDifferences(logs)
+	if err != nil {
+		return fmt.Errorf("parse verification logs: %w", err)
+	}
+	if differences != "" {
 		return fmt.Errorf("copy verification found differences:\n%s", differences)
 	}
 	return nil
 }
 
-func verificationDifferences(logs string) string {
+// verificationDifferences parses rsync's machine-prefixed item records and
+// requires its final C-locale summary line. The summary is emitted only after
+// rsync has completed its file-list comparison, so an empty log or truncated
+// stream cannot be mistaken for a clean verification.
+func verificationDifferences(logs string) (string, error) {
 	var differences []string
+	completed := false
 	for _, line := range strings.Split(logs, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if strings.TrimSpace(line) == "" {
+		if strings.HasPrefix(line, verificationRecordPrefix) {
+			record := strings.TrimPrefix(line, verificationRecordPrefix)
+			if record != "" {
+				differences = append(differences, record)
+			}
 			continue
 		}
-		// Rsync can emit unchanged entries such as ".f          path" when
-		// checksum/itemize mode is active. The itemized code is 11 bytes: a
-		// leading '.', a file-type byte, and nine unchanged attribute slots.
-		if len(line) >= 11 && line[0] == '.' {
-			unchanged := true
-			for i := 2; i < 11; i++ {
-				if line[i] != ' ' {
-					unchanged = false
-					break
-				}
-			}
-			if unchanged {
-				continue
-			}
+		if isVerificationSentinel(line) {
+			completed = true
 		}
-		differences = append(differences, line)
 	}
-	return strings.Join(differences, "\n")
+	if !completed {
+		return "", fmt.Errorf("completion sentinel not found")
+	}
+	return strings.Join(differences, "\n"), nil
+}
+
+func isVerificationSentinel(line string) bool {
+	if !strings.HasPrefix(line, verificationSentinelPrefix) {
+		return false
+	}
+	parts := strings.Fields(strings.TrimPrefix(line, verificationSentinelPrefix))
+	if len(parts) < 4 || parts[1] != "speedup" || parts[2] != "is" {
+		return false
+	}
+	_, sizeErr := strconv.ParseUint(strings.ReplaceAll(parts[0], ",", ""), 10, 64)
+	_, speedErr := strconv.ParseFloat(strings.TrimSuffix(parts[3], " (DRY RUN)"), 64)
+	return sizeErr == nil && speedErr == nil
 }
 
 func verifyArgs(copyArgs []string, nonRoot bool) []string {
@@ -167,7 +203,7 @@ func verifyArgs(copyArgs []string, nonRoot bool) []string {
 	if nonRoot {
 		args = []string{"-rlHtniO", "--checksum"}
 	}
-	args = append(args, "--exclude=lost+found", "--delete", "--itemize-changes")
+	args = append(args, "--exclude=lost+found", "--delete", "--itemize-changes", "--stats", "--out-format="+verificationRecordPrefix+"%i %n%L")
 	for _, arg := range copyArgs {
 		if isRsyncSelectionArg(arg) {
 			args = append(args, arg)
@@ -257,22 +293,45 @@ func waitForJob(ctx context.Context, client kubernetes.Interface, namespace, nam
 	return err
 }
 
-func jobLogs(ctx context.Context, client kubernetes.Interface, namespace, jobName string) (string, error) {
+func jobLogs(ctx context.Context, client kubernetes.Interface, reader podLogReader, namespace, jobName string) (string, error) {
 	pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "shrink-pvc-job=" + jobName})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("list rsync job pods: %w", err)
 	}
-	var parts []string
+	if len(pods.Items) == 0 {
+		return "", fmt.Errorf("no rsync job pods found")
+	}
+	if reader == nil {
+		reader = func(ctx context.Context, namespace, pod string, options *corev1.PodLogOptions) (io.ReadCloser, error) {
+			return client.CoreV1().Pods(namespace).GetLogs(pod, options).Stream(ctx)
+		}
+	}
+	var logs strings.Builder
 	for _, pod := range pods.Items {
-		stream, err := client.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{}).Stream(ctx)
+		stream, err := reader(ctx, namespace, pod.Name, &corev1.PodLogOptions{Container: "rsync"})
 		if err != nil {
-			continue
+			return "", fmt.Errorf("open logs for pod %s: %w", pod.Name, err)
 		}
-		b, _ := io.ReadAll(stream)
-		_ = stream.Close()
-		if len(b) > 0 {
-			parts = append(parts, string(b))
+		remaining := int64(maxJobLogBytes - logs.Len())
+		if remaining <= 0 {
+			_ = stream.Close()
+			return "", fmt.Errorf("rsync job logs exceed %d bytes", maxJobLogBytes)
 		}
+		b, readErr := io.ReadAll(io.LimitReader(stream, remaining+1))
+		closeErr := stream.Close()
+		if readErr != nil {
+			return "", fmt.Errorf("read logs for pod %s: %w", pod.Name, readErr)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf("close logs for pod %s: %w", pod.Name, closeErr)
+		}
+		if int64(len(b)) > remaining {
+			return "", fmt.Errorf("rsync job logs exceed %d bytes", maxJobLogBytes)
+		}
+		if logs.Len() > 0 && len(b) > 0 {
+			logs.WriteByte('\n')
+		}
+		logs.Write(b)
 	}
-	return strings.TrimSpace(strings.Join(parts, "\n")), nil
+	return strings.TrimSpace(logs.String()), nil
 }
