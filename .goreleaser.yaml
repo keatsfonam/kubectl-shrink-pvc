@@ -34,5 +34,15 @@ archives:
 checksum:
   name_template: checksums.txt
 
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.bundle"
+    args:
+      - sign-blob
+      - --yes
+      - --bundle=${signature}
+      - ${artifact}
+
 changelog:
   use: github-native
