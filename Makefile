@@ -22,7 +22,8 @@ e2e:
 	hack/e2e.sh
 
 snapshot:
-	goreleaser release --snapshot --clean
+	goreleaser check
+	goreleaser release --snapshot --clean --skip=sign
 
 clean:
 	rm -rf dist $(PLUGIN)

@@ -5,76 +5,14 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: read
+permissions: {}
 
-env:
-  GO_VERSION: "1.26.5"
-  GOVULNCHECK_VERSION: "v1.6.0"
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: false
-      - name: Check formatting
-        shell: bash
-        run: |
-          unformatted=$(gofmt -l cmd internal)
-          if [[ -n "$unformatted" ]]; then
-            printf 'The following Go files need gofmt:\n%s\n' "$unformatted"
-            exit 1
-          fi
-      - name: Check module files are tidy
-        run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
-      - name: Vet
-        run: go vet ./...
-      - name: Test with race detector
-        run: go test -race ./...
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
-      - name: Check reachable vulnerabilities
-        run: govulncheck ./...
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: false
-      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
-      - run: shellcheck hack/*.sh
-
-  e2e:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: false
-      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
-      - run: hack/e2e.sh
-
-  release-snapshot:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: false
-      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
-        with:
-          version: "~> v2"
-          args: release --snapshot --clean --skip=sign
+  validate:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/validate.yml

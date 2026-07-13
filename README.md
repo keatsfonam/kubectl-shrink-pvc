@@ -22,7 +22,8 @@ Initial implementation:
 Download the archive for your platform from the [releases page](https://github.com/keatsfonam/kubectl-shrink-pvc/releases), unpack it, and put `kubectl-shrink_pvc` on your `PATH`:
 
 ```sh
-tar -xzf kubectl-shrink-pvc_v0.3.0_darwin_arm64.tar.gz
+version=v0.4.0
+tar -xzf "kubectl-shrink-pvc_${version}_darwin_arm64.tar.gz"
 install -m 0755 kubectl-shrink_pvc /usr/local/bin/kubectl-shrink_pvc
 kubectl shrink-pvc --help
 ```
@@ -45,6 +46,8 @@ kubectl shrink-pvc data --size 20Gi -n app --dry-run
 ```
 
 Real run: prints the same plan, asks for confirmation, then scales Deployment(s) down, inspects the source PVC, copies the data through a temporary smaller PVC, recreates the original at the new size, copies the data back, and restores the Deployment replicas.
+
+Before starting, suspend anything that can recreate or rescale consumers or rewrite the PVC: HorizontalPodAutoscalers, GitOps reconcilers, operators, scheduled jobs, and backup/restore automation. Record their prior state so you can restore it after the shrink. Do not run concurrent shrink operations against the same PVC or against PVCs mounted by the same Deployment; consumer scaling and recovery state are coordinated per operation, not globally.
 
 ```sh
 kubectl shrink-pvc data --size 20Gi -n app
@@ -96,6 +99,21 @@ kubectl shrink-pvc data --size 20Gi -n app --resume
 
 Resume validates PVC UIDs and operation annotations before adopting or deleting anything. An unrelated same-name PVC is never deleted. Keep the state ConfigMap and temporary PVC until recovery completes; successful completion removes the state automatically. Use `--keep-temp` for cautious runs until you are comfortable with the workflow.
 
+While recovery state exists, leave Deployment consumers suspended and do not manually create a same-name source or temporary PVC. Inspect `<pvc>-shrink-state`, confirm the temporary PVC still exists, then resume with exactly the original size, image, UID, and rsync options. If resume refuses an ownership or UID check, stop and investigate rather than deleting the conflicting object. After success, confirm the Deployment replica counts and data, then re-enable GitOps, autoscaling, operators, jobs, and backup automation in a controlled order. A resumed operation is mutating; `--dry-run` is not a preview mode for a matching `--resume` operation.
+
+## Verify a release
+
+Each release publishes `checksums.txt`, a keyless Sigstore bundle for it, and GitHub build-provenance attestations for the checksum manifest and archives. After downloading an archive and those files from the release:
+
+```sh
+sha256sum --check --ignore-missing checksums.txt
+cosign verify-blob --bundle checksums.txt.bundle checksums.txt
+gh attestation verify kubectl-shrink-pvc_v0.4.0_linux_amd64.tar.gz \
+  --repo keatsfonam/kubectl-shrink-pvc
+```
+
+Use `shasum -a 256 -c checksums.txt` instead of `sha256sum` on macOS. Verification requires the `cosign` and GitHub CLI (`gh`) tools; inspect the reported GitHub identity and repository before trusting the artifact.
+
 ## Limitations
 
 - No StatefulSet support yet.
@@ -105,7 +123,8 @@ Resume validates PVC UIDs and operation annotations before adopting or deleting 
 - Static PVs with selectors or specialized binding requirements may need manual handling.
 - Namespaces that enforce the `restricted` PodSecurity profile reject the default root inspect/copy pods; use `--run-as-user` there and accept that file ownership is not preserved.
 - Inspect and rsync pods set no node affinity; for `ReadWriteOnce` volumes on multi-node clusters, they may hang until `--timeout` if scheduled away from the node where the volume can attach.
-- HorizontalPodAutoscalers targeting a Deployment consumer must be suspended before the workflow starts; the plugin refuses to continue while one is active.
+- HorizontalPodAutoscalers targeting a Deployment consumer must be suspended before the workflow starts; the plugin refuses to continue while one is active. Other reconcilers and operators are not detected and must be suspended manually.
+- Concurrent operations are not coordinated across PVCs. Never overlap operations that share a Deployment consumer, and allow only one operation per PVC.
 - Consumer ownership, replica counts, and the source PVC UID are revalidated after confirmation and immediately before deletion.
 
 ## License
