@@ -295,6 +295,9 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	if err := updatePhase(operation.PhaseCopiedBack); err != nil {
 		return err
 	}
+	if err := validateRecreatedSource(ctx, client, state); err != nil {
+		return err
+	}
 	// Consumers may only be restored after copy-back is durably checkpointed;
 	// otherwise resume could repeat rsync while applications are writing.
 	restoreOnExit = true
@@ -369,6 +372,20 @@ func revalidateExecutionPlan(ctx context.Context, client kubernetes.Interface, n
 		return nil, nil, fmt.Errorf("HorizontalPodAutoscalers target PVC consumers; suspend them and rerun: %s", strings.Join(items, ", "))
 	}
 	return currentSource, refreshed, nil
+}
+
+func validateRecreatedSource(ctx context.Context, client kubernetes.Interface, state *operation.State) error {
+	recreated, err := client.CoreV1().PersistentVolumeClaims(state.Namespace).Get(ctx, state.SourceName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("validate recreated source before restoration: %w", err)
+	}
+	if recreated.UID != state.RecreatedSourceUID {
+		return fmt.Errorf("recreated source PVC %s/%s was replaced before restoration", state.Namespace, state.SourceName)
+	}
+	if err := operation.ValidateRecreatedPVC(recreated, state.OperationID); err != nil {
+		return fmt.Errorf("validate recreated source before restoration: %w", err)
+	}
+	return nil
 }
 
 func validateDestructiveBoundary(ctx context.Context, client kubernetes.Interface, namespace, pvcName string, expectedUID types.UID, deployments []kube.DeploymentRef, noScale bool) error {
