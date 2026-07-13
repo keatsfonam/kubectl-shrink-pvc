@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   id-token: write
+  attestations: write
 
 env:
   GO_VERSION: "1.26.0"
@@ -32,6 +33,14 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: "dist/*.tar.gz"
+      - name: Attest checksum manifest
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: "dist/checksums.txt"
       # Enable once the plugin is accepted into krew-index. The bot opens the
       # version-bump PR there for each new release; the first submission has
       # to be done by hand.
