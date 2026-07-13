@@ -105,7 +105,7 @@ func (m RsyncMover) Verify(ctx context.Context, req Request) error {
 	runName := uniqueName(req.JobName + "-verify")
 	backoff := int32(0)
 	nonRoot := req.RunAsUser >= 0
-	job := buildJob(req, runName, verifyArgs(), nonRoot, backoff, true)
+	job := buildJob(req, runName, verifyArgs(req.Args, nonRoot), nonRoot, backoff, true)
 	if _, err := m.Client.BatchV1().Jobs(req.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create rsync verification job: %w", err)
 	}
@@ -135,8 +135,27 @@ func (m RsyncMover) Verify(ctx context.Context, req Request) error {
 	return nil
 }
 
-func verifyArgs() []string {
-	return []string{"-rltnciO", "--checksum", "--exclude=lost+found", "--delete", "--itemize-changes", "--out-format=%i %n%L", "/src/", "/dest/"}
+func verifyArgs(copyArgs []string, nonRoot bool) []string {
+	args := []string{"-aHAXniO", "--numeric-ids", "--checksum"}
+	if nonRoot {
+		args = []string{"-rlHtniO", "--checksum"}
+	}
+	args = append(args, "--exclude=lost+found", "--delete", "--itemize-changes", "--out-format=%i %n%L")
+	for _, arg := range copyArgs {
+		if isRsyncSelectionArg(arg) {
+			args = append(args, arg)
+		}
+	}
+	return append(args, "/src/", "/dest/")
+}
+
+func isRsyncSelectionArg(arg string) bool {
+	for _, prefix := range []string{"--exclude=", "--include=", "--filter="} {
+		if strings.HasPrefix(arg, prefix) {
+			return true
+		}
+	}
+	return arg == "--delete-excluded" || arg == "--prune-empty-dirs"
 }
 
 func rsyncArgs(extraArgs []string, nonRoot bool) []string {

@@ -42,7 +42,7 @@ func TestBuildJobUsesDirectRsyncArgv(t *testing.T) {
 }
 
 func TestVerificationJobMountsBothPVCsReadOnly(t *testing.T) {
-	job := buildJob(Request{Namespace: "ns", SourcePVC: "source", DestPVC: "dest", Image: "image"}, "verify", verifyArgs(), false, 0, true)
+	job := buildJob(Request{Namespace: "ns", SourcePVC: "source", DestPVC: "dest", Image: "image"}, "verify", verifyArgs(nil, false), false, 0, true)
 	for _, mount := range job.Spec.Template.Spec.Containers[0].VolumeMounts {
 		if !mount.ReadOnly {
 			t.Fatalf("verification mount %s is writable", mount.Name)
@@ -56,11 +56,11 @@ func TestVerificationJobMountsBothPVCsReadOnly(t *testing.T) {
 }
 
 func TestVerifyArgs(t *testing.T) {
-	got := verifyArgs()
+	got := verifyArgs([]string{"--exclude=cache", "--bwlimit=10m"}, false)
 	if got[len(got)-2] != "/src/" || got[len(got)-1] != "/dest/" {
 		t.Fatalf("unexpected verification operands: %#v", got)
 	}
-	for _, required := range []string{"--checksum", "--delete", "--itemize-changes"} {
+	for _, required := range []string{"-aHAXniO", "--numeric-ids", "--checksum", "--delete", "--itemize-changes", "--exclude=cache"} {
 		found := false
 		for _, arg := range got {
 			if arg == required {
@@ -70,6 +70,18 @@ func TestVerifyArgs(t *testing.T) {
 		if !found {
 			t.Fatalf("verification args missing %s: %#v", required, got)
 		}
+	}
+	for _, arg := range got {
+		if arg == "--bwlimit=10m" {
+			t.Fatal("non-selection copy option must not alter verification")
+		}
+	}
+}
+
+func TestVerifyArgsNonRootOmitsPrivilegedMetadata(t *testing.T) {
+	got := verifyArgs(nil, true)
+	if got[0] != "-rlHtniO" {
+		t.Fatalf("unexpected non-root verification policy: %#v", got)
 	}
 }
 
