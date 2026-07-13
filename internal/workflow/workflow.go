@@ -141,13 +141,42 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		if err != nil {
 			return err
 		}
-		store := operation.Store{Client: client, Namespace: namespace, Name: operation.NameForPVC(cfg.PVCName)}
+		store := operation.StoreForPVC(client, namespace, cfg.PVCName)
 		if err := store.EnsureAbsent(ctx); err != nil {
 			return err
 		}
 		operationID, err := operation.NewID()
 		if err != nil {
 			return err
+		}
+		finalPVC, err := pvcmanifest.Build(source, cfg.PVCName, target)
+		if err != nil {
+			return err
+		}
+		operation.StampRecreatedPVC(finalPVC, operationID)
+		finalPVCJSON, err := json.Marshal(finalPVC)
+		if err != nil {
+			return fmt.Errorf("encode replacement PVC: %w", err)
+		}
+		// Persist the approved UID-bound replica counts before the first scale
+		// write. A crash from this point can be recovered with --resume.
+		state := &operation.State{
+			Version: 1, OperationID: operationID, Namespace: namespace, SourceName: cfg.PVCName,
+			OriginalSourceUID: source.UID, TempName: cfg.TempName, TargetSize: target.String(),
+			Image: cfg.Image, RsyncArgs: cfg.RsyncArgs, RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
+			KeepTemp: cfg.KeepTemp, NoScale: cfg.NoScale, Deployments: plan.Deployments,
+			FinalPVCJSON: finalPVCJSON, Phase: operation.PhasePrepared,
+		}
+		stateCM, err := store.Create(ctx, state)
+		if err != nil {
+			return err
+		}
+		stateResourceVersion := stateCM.ResourceVersion
+		updatePhase := func(phase operation.Phase) error {
+			state.Phase = phase
+			var updateErr error
+			stateResourceVersion, updateErr = store.Update(ctx, state, stateResourceVersion)
+			return updateErr
 		}
 
 		scaled := false
@@ -211,11 +240,6 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		tempPVC.Annotations[tempSourceUIDAnnotation] = string(source.UID)
 		tempPVC.Annotations[tempSourceNameAnnotation] = source.Name
 		tempPVC.Annotations[operation.AnnotationOperationID] = operationID
-		finalPVC, err := pvcmanifest.Build(source, cfg.PVCName, target)
-		if err != nil {
-			return err
-		}
-		operation.StampRecreatedPVC(finalPVC, operationID)
 		fmt.Fprintf(cfg.IOStreams.Out, "Creating temporary PVC %s/%s...\n", namespace, cfg.TempName)
 		tempPVC, reused, err := ensureTemporaryPVC(ctx, client, namespace, tempPVC, target)
 		if err != nil {
@@ -241,40 +265,22 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 			return err
 		}
 
-		finalPVCJSON, err := json.Marshal(finalPVC)
-		if err != nil {
-			return fmt.Errorf("encode replacement PVC: %w", err)
-		}
-		state := &operation.State{
-			Version: 1, OperationID: operationID, Namespace: namespace, SourceName: cfg.PVCName,
-			OriginalSourceUID: source.UID, TempName: cfg.TempName, TempUID: tempPVC.UID,
-			TargetSize: target.String(), Image: cfg.Image, RsyncArgs: cfg.RsyncArgs,
-			RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup, KeepTemp: cfg.KeepTemp, NoScale: cfg.NoScale,
-			Deployments: plan.Deployments, FinalPVCJSON: finalPVCJSON, Phase: operation.PhaseCopiedToTemp,
-		}
-		stateCM, err := store.Create(ctx, state)
-		if err != nil {
+		state.TempUID = tempPVC.UID
+		if err := updatePhase(operation.PhaseCopiedToTemp); err != nil {
 			return err
-		}
-		stateResourceVersion := stateCM.ResourceVersion
-		updatePhase := func(phase operation.Phase) error {
-			state.Phase = phase
-			var updateErr error
-			stateResourceVersion, updateErr = store.Update(ctx, state, stateResourceVersion)
-			return updateErr
 		}
 
 		if err := validateDestructiveBoundary(ctx, client, namespace, cfg.PVCName, source.UID, plan.Deployments, cfg.NoScale); err != nil {
 			return err
 		}
-		fmt.Fprintf(cfg.IOStreams.Out, "Deleting original PVC %s/%s...\n", namespace, cfg.PVCName)
-		if err := kube.DeletePVC(ctx, client, namespace, cfg.PVCName, source.UID); err != nil {
+		// Checkpoint and disarm restoration before the ambiguous Delete call: the
+		// API server can accept deletion even when the client receives an error.
+		restoreOnExit = false
+		if err := updatePhase(operation.PhaseSourceDeleteRequested); err != nil {
 			return err
 		}
-		// Once deletion is accepted, restoring consumers could start pods against a
-		// deleting or missing claim even if waiting/checkpointing subsequently fails.
-		restoreOnExit = false
-		if err := updatePhase(operation.PhaseSourceDeleteAccepted); err != nil {
+		fmt.Fprintf(cfg.IOStreams.Out, "Deleting original PVC %s/%s...\n", namespace, cfg.PVCName)
+		if err := kube.DeletePVC(ctx, client, namespace, cfg.PVCName, source.UID); err != nil {
 			return err
 		}
 		if err := kube.WaitForPVCDeleted(ctx, client, namespace, cfg.PVCName, source.UID, cfg.Timeout, pollInterval); err != nil {
@@ -391,7 +397,7 @@ func revalidateExecutionPlan(ctx context.Context, client kubernetes.Interface, n
 			return nil, nil, fmt.Errorf("new Deployment consumer %s/%s appeared after confirmation; rerun the command", dep.Namespace, dep.Name)
 		}
 		if approvedDep.UID == "" || dep.UID != approvedDep.UID {
-			return nil, nil, fmt.Errorf("Deployment consumer %s/%s was replaced after confirmation; rerun the command", dep.Namespace, dep.Name)
+			return nil, nil, fmt.Errorf("deployment consumer %s/%s was replaced after confirmation; rerun the command", dep.Namespace, dep.Name)
 		}
 	}
 
@@ -403,7 +409,7 @@ func revalidateExecutionPlan(ctx context.Context, client kubernetes.Interface, n
 			return nil, nil, fmt.Errorf("refresh Deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 		}
 		if dep.UID == "" || current.UID != dep.UID {
-			return nil, nil, fmt.Errorf("Deployment consumer %s/%s was replaced after confirmation", dep.Namespace, dep.Name)
+			return nil, nil, fmt.Errorf("deployment consumer %s/%s was replaced after confirmation", dep.Namespace, dep.Name)
 		}
 		scale, err := client.AppsV1().Deployments(dep.Namespace).GetScale(ctx, dep.Name, metav1.GetOptions{})
 		if err != nil {
@@ -471,7 +477,7 @@ func validateWorkloadsQuiesced(ctx context.Context, client kubernetes.Interface,
 			return fmt.Errorf("new Deployment consumer %s/%s appeared; refusing to continue", dep.Namespace, dep.Name)
 		}
 		if approved.UID == "" || dep.UID != approved.UID {
-			return fmt.Errorf("Deployment consumer %s/%s was replaced; refusing to continue", dep.Namespace, dep.Name)
+			return fmt.Errorf("deployment consumer %s/%s was replaced; refusing to continue", dep.Namespace, dep.Name)
 		}
 	}
 	for _, dep := range deployments {
@@ -480,7 +486,7 @@ func validateWorkloadsQuiesced(ctx context.Context, client kubernetes.Interface,
 			return fmt.Errorf("verify Deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 		}
 		if dep.UID == "" || current.UID != dep.UID {
-			return fmt.Errorf("Deployment %s/%s was replaced; refusing to continue", dep.Namespace, dep.Name)
+			return fmt.Errorf("deployment %s/%s was replaced; refusing to continue", dep.Namespace, dep.Name)
 		}
 		scale, err := client.AppsV1().Deployments(dep.Namespace).GetScale(ctx, dep.Name, metav1.GetOptions{})
 		if err != nil {

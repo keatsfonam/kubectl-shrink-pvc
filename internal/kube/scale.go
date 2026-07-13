@@ -41,7 +41,7 @@ func scaleDeployment(ctx context.Context, client kubernetes.Interface, dep Deplo
 		return false, fmt.Errorf("get Deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
 	if dep.UID == "" || current.UID != dep.UID {
-		return false, fmt.Errorf("Deployment %s/%s was replaced; refusing to scale it", dep.Namespace, dep.Name)
+		return false, fmt.Errorf("deployment %s/%s was replaced; refusing to scale it", dep.Namespace, dep.Name)
 	}
 	scale, err := client.AppsV1().Deployments(dep.Namespace).GetScale(ctx, dep.Name, metav1.GetOptions{})
 	if err != nil {
@@ -49,7 +49,7 @@ func scaleDeployment(ctx context.Context, client kubernetes.Interface, dep Deplo
 	}
 	if (scale.UID != "" && scale.UID != dep.UID) ||
 		(current.ResourceVersion != "" && scale.ResourceVersion != "" && scale.ResourceVersion != current.ResourceVersion) {
-		return false, fmt.Errorf("Deployment %s/%s was replaced while reading its scale; refusing to update it", dep.Namespace, dep.Name)
+		return false, fmt.Errorf("deployment %s/%s was replaced while reading its scale; refusing to update it", dep.Namespace, dep.Name)
 	}
 	scale.Spec.Replicas = replicas
 	if _, err := client.AppsV1().Deployments(dep.Namespace).UpdateScale(ctx, dep.Name, scale, metav1.UpdateOptions{}); err != nil {

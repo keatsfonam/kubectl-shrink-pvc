@@ -27,7 +27,11 @@ const (
 type Phase string
 
 const (
-	PhaseCopiedToTemp         Phase = "CopiedToTemp"
+	PhasePrepared              Phase = "Prepared"
+	PhaseCopiedToTemp          Phase = "CopiedToTemp"
+	PhaseSourceDeleteRequested Phase = "SourceDeleteRequested"
+	// PhaseSourceDeleteAccepted is retained for recovery compatibility with
+	// state written by releases that checkpointed only after Delete returned.
 	PhaseSourceDeleteAccepted Phase = "SourceDeleteAccepted"
 	PhaseSourceDeleted        Phase = "SourceDeleted"
 	PhaseSourceRecreated      Phase = "SourceRecreated"
@@ -67,6 +71,14 @@ func NameForPVC(sourceName string) string {
 	return naming.SafeDNSLabel(sourceName + "-shrink-state")
 }
 
+func LegacyNameForPVC(sourceName string) string {
+	return naming.LegacySafeDNSLabel(sourceName + "-shrink-state")
+}
+
+func StoreForPVC(client kubernetes.Interface, namespace, sourceName string) Store {
+	return Store{Client: client, Namespace: namespace, Name: NameForPVC(sourceName), LegacyName: LegacyNameForPVC(sourceName)}
+}
+
 func StampRecreatedPVC(pvc *corev1.PersistentVolumeClaim, operationID string) {
 	if pvc.Annotations == nil {
 		pvc.Annotations = map[string]string{}
@@ -83,9 +95,10 @@ func ValidateRecreatedPVC(pvc *corev1.PersistentVolumeClaim, operationID string)
 }
 
 type Store struct {
-	Client    kubernetes.Interface
-	Namespace string
-	Name      string
+	Client     kubernetes.Interface
+	Namespace  string
+	Name       string
+	LegacyName string
 }
 
 func (s Store) Create(ctx context.Context, state *State) (*corev1.ConfigMap, error) {
@@ -107,14 +120,44 @@ func (s Store) Create(ctx context.Context, state *State) (*corev1.ConfigMap, err
 }
 
 func (s Store) EnsureAbsent(ctx context.Context) error {
+	names := []string{s.Name}
+	if s.LegacyName != "" && s.LegacyName != s.Name {
+		names = append(names, s.LegacyName)
+	}
+	for _, name := range names {
+		_, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("check for existing operation state %s/%s: %w", s.Namespace, name, err)
+		}
+		return fmt.Errorf("operation state %s/%s already exists; rerun with --resume", s.Namespace, name)
+	}
+	return nil
+}
+
+// Resolve selects the hashed state name when present, otherwise falling back
+// to the legacy truncated name so interrupted older operations remain resumable.
+func (s Store) Resolve(ctx context.Context) (Store, error) {
 	_, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(ctx, s.Name, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return nil
+	if err == nil {
+		return s, nil
 	}
-	if err != nil {
-		return fmt.Errorf("check for existing operation state %s/%s: %w", s.Namespace, s.Name, err)
+	if !apierrors.IsNotFound(err) {
+		return s, fmt.Errorf("locate operation state %s/%s: %w", s.Namespace, s.Name, err)
 	}
-	return fmt.Errorf("operation state %s/%s already exists; rerun with --resume", s.Namespace, s.Name)
+	if s.LegacyName != "" && s.LegacyName != s.Name {
+		_, legacyErr := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(ctx, s.LegacyName, metav1.GetOptions{})
+		if legacyErr == nil {
+			s.Name = s.LegacyName
+			return s, nil
+		}
+		if !apierrors.IsNotFound(legacyErr) {
+			return s, fmt.Errorf("locate legacy operation state %s/%s: %w", s.Namespace, s.LegacyName, legacyErr)
+		}
+	}
+	return s, fmt.Errorf("load operation state %s/%s: not found", s.Namespace, s.Name)
 }
 
 func (s Store) Load(ctx context.Context) (*State, *corev1.ConfigMap, error) {

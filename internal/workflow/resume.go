@@ -20,7 +20,10 @@ import (
 )
 
 func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namespace string, requestedTarget resource.Quantity) (retErr error) {
-	store := operation.Store{Client: client, Namespace: namespace, Name: operation.NameForPVC(cfg.PVCName)}
+	store, err := operation.StoreForPVC(client, namespace, cfg.PVCName).Resolve(ctx)
+	if err != nil {
+		return err
+	}
 	state, stateCM, err := store.Load(ctx)
 	if err != nil {
 		return err
@@ -72,6 +75,43 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		}
 	}()
 
+	if state.Phase == operation.PhasePrepared {
+		// No destructive source action is possible in Prepared. Restore the
+		// original UID-bound replica counts and remove only temp data demonstrably
+		// owned by this operation, then retire the checkpoint so a fresh run can
+		// repeat inspection and copy verification.
+		source, getErr := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, state.SourceName, metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("inspect intact source while recovering prepared operation: %w", getErr)
+		}
+		if source.UID != state.OriginalSourceUID {
+			return fmt.Errorf("source PVC %s/%s was replaced; refusing prepared-state recovery", namespace, state.SourceName)
+		}
+		if !state.NoScale && len(state.Deployments) > 0 {
+			if err := kube.RestoreDeployments(ctx, client, state.Deployments); err != nil {
+				return fmt.Errorf("restore Deployment replicas from prepared state: %w", err)
+			}
+		}
+		temp, getErr := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, state.TempName, metav1.GetOptions{})
+		if getErr == nil {
+			if temp.Annotations[operation.AnnotationOperationID] != state.OperationID ||
+				temp.Annotations[tempSourceUIDAnnotation] != string(state.OriginalSourceUID) ||
+				temp.Annotations[tempSourceNameAnnotation] != state.SourceName {
+				return fmt.Errorf("temporary PVC %s/%s is not owned by prepared operation", namespace, state.TempName)
+			}
+			if err := kube.DeletePVC(ctx, client, namespace, state.TempName, temp.UID); err != nil {
+				return err
+			}
+		} else if !apierrors.IsNotFound(getErr) {
+			return fmt.Errorf("inspect temporary PVC during prepared-state recovery: %w", getErr)
+		}
+		if err := store.Delete(ctx, stateCM.UID); err != nil {
+			return err
+		}
+		fmt.Fprintln(cfg.IOStreams.Out, "Recovered pre-copy operation state and restored Deployment replicas; rerun the shrink command to start a fresh verified copy.")
+		return nil
+	}
+
 	if state.Phase == operation.PhaseCopiedToTemp {
 		// Recovery data must be present and owned before touching an intact source.
 		if _, err := loadOwnedTempPVC(ctx, client, state); err != nil {
@@ -102,19 +142,38 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 			if err := validateDestructiveBoundary(ctx, client, namespace, state.SourceName, state.OriginalSourceUID, state.Deployments, state.NoScale); err != nil {
 				return err
 			}
-			if err := kube.DeletePVC(ctx, client, namespace, state.SourceName, state.OriginalSourceUID); err != nil {
+			restoreOnExit = false
+			if err := updatePhase(operation.PhaseSourceDeleteRequested); err != nil {
 				return err
 			}
-			restoreOnExit = false
-			if err := updatePhase(operation.PhaseSourceDeleteAccepted); err != nil {
+			if err := kube.DeletePVC(ctx, client, namespace, state.SourceName, state.OriginalSourceUID); err != nil {
 				return err
 			}
 		}
 	}
 
-	if state.Phase == operation.PhaseSourceDeleteAccepted {
+	if state.Phase == operation.PhaseSourceDeleteRequested || state.Phase == operation.PhaseSourceDeleteAccepted {
 		if _, err := loadOwnedTempPVC(ctx, client, state); err != nil {
 			return err
+		}
+		restoreOnExit = false
+		if err := validateWorkloadsQuiesced(ctx, client, namespace, state.SourceName, state.Deployments, state.NoScale); err != nil {
+			return fmt.Errorf("revalidate workloads after delete request: %w", err)
+		}
+		source, getErr := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, state.SourceName, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(getErr):
+			// The prior request succeeded even if its response was lost.
+		case getErr != nil:
+			return fmt.Errorf("inspect source after delete request: %w", getErr)
+		case source.UID != state.OriginalSourceUID:
+			return fmt.Errorf("source PVC %s/%s was replaced after delete request; refusing to resume", namespace, state.SourceName)
+		default:
+			// The request was not accepted or deletion is still pending. Retrying
+			// with the original UID precondition is idempotent and ownership-safe.
+			if err := kube.DeletePVC(ctx, client, namespace, state.SourceName, state.OriginalSourceUID); err != nil {
+				return err
+			}
 		}
 		if err := kube.WaitForPVCDeleted(ctx, client, namespace, state.SourceName, state.OriginalSourceUID, cfg.Timeout, pollInterval); err != nil {
 			return err

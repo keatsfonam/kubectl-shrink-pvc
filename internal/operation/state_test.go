@@ -2,6 +2,7 @@ package operation
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -80,6 +81,41 @@ func TestStoreRejectsExistingOperation(t *testing.T) {
 	state := &State{Version: 1, OperationID: "op", Namespace: "ns", SourceName: "data"}
 	if _, err := store.Create(context.Background(), state); err == nil {
 		t.Fatal("expected existing operation error")
+	}
+}
+
+func TestStoreResolvesLegacyLongName(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	pvcName := strings.Repeat("a", 60)
+	store := StoreForPVC(client, "ns", pvcName)
+	if store.Name == store.LegacyName {
+		t.Fatal("expected hashed and legacy names to differ")
+	}
+	legacy := Store{Client: client, Namespace: "ns", Name: store.LegacyName}
+	state := &State{Version: 1, OperationID: "op", Namespace: "ns", SourceName: pvcName, Phase: PhaseCopiedToTemp}
+	if _, err := legacy.Create(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := store.Resolve(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Name != store.LegacyName {
+		t.Fatalf("resolved %q, want legacy %q", resolved.Name, store.LegacyName)
+	}
+	got, _, err := resolved.Load(context.Background())
+	if err != nil || got.SourceName != pvcName {
+		t.Fatalf("legacy load: state=%#v err=%v", got, err)
+	}
+	if err := store.EnsureAbsent(context.Background()); err == nil {
+		t.Fatal("legacy recovery state was not detected")
+	}
+}
+
+func TestGeneratedStateNamesDoNotCollide(t *testing.T) {
+	prefix := strings.Repeat("a", 58)
+	if NameForPVC(prefix+"one") == NameForPVC(prefix+"two") {
+		t.Fatal("distinct long PVC names generated the same state name")
 	}
 }
 

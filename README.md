@@ -37,7 +37,9 @@ install -m 0755 kubectl-shrink_pvc /usr/local/bin/kubectl-shrink_pvc
 
 The plugin is not in the Krew index yet. `.krew.yaml` at the repo root is the manifest template for that submission; release archives are built to match it.
 
-The Kubernetes identity running the plugin needs the existing PVC, Pod/log, Job, ConfigMap, Deployment/scale, and HPA permissions used by the workflow. It also needs `get`, `create`, `update`, and `delete` on namespaced `coordination.k8s.io/leases`; a per-PVC Lease serializes destructive runs and expires 30 seconds after a hard crash.
+A complete least-privilege namespaced [Role, RoleBinding, and ServiceAccount example](examples/rbac.yaml) covers the PVC, Pod/log, Job, ConfigMap, Deployment/scale, controller-template discovery, HPA, and Lease permissions used by the workflow. Replace its `app` namespace before applying it. Bind the Role to the user or service account that actually runs the local plugin; the included ServiceAccount subject is an example.
+
+`--dry-run` still performs live planning and therefore needs the read-only `get`/`list` permissions in that Role, but it does not need or exercise the mutating verbs. Real runs and `--resume` need the full manifest. The renewable per-PVC Lease uses `coordination.k8s.io/leases`; after a hard crash, takeover requires observing the Lease record remain unchanged for a full 30 seconds and is safe even when client clocks disagree.
 
 ## Usage
 
@@ -78,7 +80,7 @@ The tool runs in phases:
 2. Discover live pods and built-in controller templates that reference the PVC.
 3. Refuse unsupported consumers such as StatefulSets, DaemonSets, Jobs, CronJobs, and standalone ReplicaSets in v1.
 4. Print the plan and wait for confirmation unless `--yes` is set.
-5. Acquire a renewable per-PVC Lease and scale Deployment consumers to zero unless `--no-scale` is set.
+5. Acquire a renewable per-PVC Lease, durably checkpoint the approved source/Deployment UIDs and original replica counts, then scale Deployment consumers to zero unless `--no-scale` is set.
 6. Wait until the PVC is unmounted.
 7. Run an inspection pod that mounts the source PVC read-only and measures usage with `du`.
 8. Create a temporary PVC at the target size.
@@ -93,7 +95,7 @@ The inspection step catches obvious "data cannot fit" cases before migration. By
 
 If the command fails before the original PVC is deleted (validation, inspection, or the copy to the temporary PVC), the original PVC remains intact.
 
-After the source-to-temporary copy succeeds, the plugin persists a ConfigMap named `<pvc>-shrink-state`. If the command is interrupted during replacement or restoration, rerun it with the original options plus `--resume`, for example:
+Before the first scale write, the plugin persists a recovery ConfigMap whose generated name ends in `-shrink-state` (long names use a stable hash suffix). If the command is interrupted during replacement or restoration, rerun it with the original options plus `--resume`, for example:
 
 ```sh
 kubectl shrink-pvc data --size 20Gi -n app --resume
