@@ -27,7 +27,7 @@ type Request struct {
 	DestPVC      string
 	Image        string
 	JobName      string
-	ExtraArgs    string
+	Args         []string
 	RunAsUser    int64
 	FSGroup      int64
 	WaitTimeout  time.Duration
@@ -42,9 +42,9 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 	runName := uniqueName(req.JobName)
 	backoff := int32(0)
 	nonRoot := req.RunAsUser >= 0
-	cmd := rsyncCommand(req.ExtraArgs, nonRoot)
+	args := rsyncArgs(req.Args, nonRoot)
 
-	job := buildJob(req, runName, cmd, nonRoot, backoff)
+	job := buildJob(req, runName, args, nonRoot, backoff)
 
 	if _, err := m.Client.BatchV1().Jobs(req.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create rsync job: %w", err)
@@ -69,7 +69,7 @@ func (m RsyncMover) Move(ctx context.Context, req Request) error {
 	return nil
 }
 
-func buildJob(req Request, runName, cmd string, nonRoot bool, backoff int32) *batchv1.Job {
+func buildJob(req Request, runName string, args []string, nonRoot bool, backoff int32) *batchv1.Job {
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: runName, Namespace: req.Namespace},
 		Spec: batchv1.JobSpec{
@@ -83,7 +83,8 @@ func buildJob(req Request, runName, cmd string, nonRoot bool, backoff int32) *ba
 					Containers: []corev1.Container{{
 						Name:            "rsync",
 						Image:           req.Image,
-						Command:         []string{"/bin/sh", "-c", cmd},
+						Command:         []string{"rsync"},
+						Args:            args,
 						SecurityContext: podsec.Container(nonRoot, "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "MKNOD"),
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "source", MountPath: "/src", ReadOnly: true},
@@ -100,18 +101,20 @@ func buildJob(req Request, runName, cmd string, nonRoot bool, backoff int32) *ba
 	}
 }
 
-func rsyncCommand(extraArgs string, nonRoot bool) string {
+func rsyncArgs(extraArgs []string, nonRoot bool) []string {
 	// Without root there is no way to preserve arbitrary owners, groups,
 	// exact modes, devices, or privileged xattrs, so copy content, links,
 	// and file times only. -p and dir times (-O) must stay off because
 	// chmod/utimes fail on the volume root a non-root user does not own.
 	// lost+found is fsck scratch space and root-only on ext4; never copy it.
-	base := "-aHAX --numeric-ids"
+	base := []string{"-aHAX", "--numeric-ids"}
 	if nonRoot {
-		base = "-rlHt -O"
+		base = []string{"-rlHt", "-O"}
 	}
-	cmd := "rsync " + base + " --exclude=lost+found --delete --info=progress2 " + extraArgs + " /src/ /dest/"
-	return strings.Join(strings.Fields(cmd), " ")
+	args := append([]string(nil), base...)
+	args = append(args, "--exclude=lost+found", "--delete", "--info=progress2")
+	args = append(args, extraArgs...)
+	return append(args, "/src/", "/dest/")
 }
 
 func uniqueName(base string) string {

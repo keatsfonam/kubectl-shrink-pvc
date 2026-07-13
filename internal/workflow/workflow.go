@@ -36,6 +36,7 @@ type Config struct {
 	Resume              bool
 	TempName            string
 	Image               string
+	RsyncArgs           []string
 	RsyncExtraArgs      string
 	RunAsUser           int64
 	FSGroup             int64
@@ -69,6 +70,13 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	}
 	if cfg.FSGroup < 0 && cfg.RunAsUser > 0 {
 		cfg.FSGroup = cfg.RunAsUser
+	}
+	cfg.RsyncArgs, err = normalizeRsyncArgs(cfg.RsyncArgs, cfg.RsyncExtraArgs)
+	if err != nil {
+		return err
+	}
+	if cfg.RsyncExtraArgs != "" {
+		fmt.Fprintln(cfg.IOStreams.ErrOut, "Warning: --rsync-extra-args is deprecated; use repeatable --rsync-arg=--option=value instead.")
 	}
 
 	target, err := resource.ParseQuantity(cfg.TargetSize)
@@ -207,7 +215,7 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	fmt.Fprintf(cfg.IOStreams.Out, "Copying %s -> %s...\n", cfg.PVCName, cfg.TempName)
 	if err := mover.Move(ctx, datamover.Request{
 		Namespace: namespace, SourcePVC: cfg.PVCName, DestPVC: cfg.TempName, Image: cfg.Image,
-		JobName: naming.SafeDNSLabel("shrink-copy-to-temp-" + cfg.PVCName), ExtraArgs: cfg.RsyncExtraArgs,
+		JobName: naming.SafeDNSLabel("shrink-copy-to-temp-" + cfg.PVCName), Args: cfg.RsyncArgs,
 		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
 		WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
 	}); err != nil {
@@ -221,7 +229,7 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	state := &operation.State{
 		Version: 1, OperationID: operationID, Namespace: namespace, SourceName: cfg.PVCName,
 		OriginalSourceUID: source.UID, TempName: cfg.TempName, TempUID: tempPVC.UID,
-		TargetSize: target.String(), Image: cfg.Image, RsyncExtraArgs: cfg.RsyncExtraArgs,
+		TargetSize: target.String(), Image: cfg.Image, RsyncArgs: cfg.RsyncArgs,
 		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup, KeepTemp: cfg.KeepTemp, NoScale: cfg.NoScale,
 		Deployments: plan.Deployments, FinalPVCJSON: finalPVCJSON, Phase: operation.PhaseCopiedToTemp,
 	}
@@ -268,7 +276,7 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	fmt.Fprintf(cfg.IOStreams.Out, "Copying %s -> %s...\n", cfg.TempName, cfg.PVCName)
 	if err := mover.Move(ctx, datamover.Request{
 		Namespace: namespace, SourcePVC: cfg.TempName, DestPVC: cfg.PVCName, Image: cfg.Image,
-		JobName: naming.SafeDNSLabel("shrink-copy-back-" + cfg.PVCName), ExtraArgs: cfg.RsyncExtraArgs,
+		JobName: naming.SafeDNSLabel("shrink-copy-back-" + cfg.PVCName), Args: cfg.RsyncArgs,
 		RunAsUser: cfg.RunAsUser, FSGroup: cfg.FSGroup,
 		WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
 	}); err != nil {
@@ -435,6 +443,17 @@ func confirm(cfg Config) error {
 		return err
 	}
 	return fmt.Errorf("confirmation declined")
+}
+
+func normalizeRsyncArgs(args []string, legacy string) ([]string, error) {
+	result := append([]string(nil), strings.Fields(legacy)...)
+	result = append(result, args...)
+	for _, arg := range result {
+		if arg == "" || !strings.HasPrefix(arg, "-") {
+			return nil, fmt.Errorf("rsync arguments must be options beginning with '-' and values must use --option=value: %q", arg)
+		}
+	}
+	return result, nil
 }
 
 func requiredBytesWithMargin(usedBytes int64, marginPercent int) (int64, error) {

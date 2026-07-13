@@ -43,7 +43,7 @@ type State struct {
 	TempUID            types.UID            `json:"tempUID"`
 	TargetSize         string               `json:"targetSize"`
 	Image              string               `json:"image"`
-	RsyncExtraArgs     string               `json:"rsyncExtraArgs,omitempty"`
+	RsyncArgs          []string             `json:"rsyncArgs,omitempty"`
 	RunAsUser          int64                `json:"runAsUser"`
 	FSGroup            int64                `json:"fsGroup"`
 	KeepTemp           bool                 `json:"keepTemp"`

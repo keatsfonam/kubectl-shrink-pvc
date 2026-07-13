@@ -32,6 +32,20 @@ func TestResumeRejectsChangedTarget(t *testing.T) {
 	}
 }
 
+func TestNormalizeRsyncArgs(t *testing.T) {
+	got, err := normalizeRsyncArgs([]string{"--exclude=path with spaces"}, "--partial --bwlimit=10m")
+	if err != nil {
+		t.Fatalf("normalizeRsyncArgs returned error: %v", err)
+	}
+	want := []string{"--partial", "--bwlimit=10m", "--exclude=path with spaces"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if _, err := normalizeRsyncArgs([]string{"unexpected-operand"}, ""); err == nil {
+		t.Fatal("expected operand rejection")
+	}
+}
+
 func TestRequiredBytesWithMargin(t *testing.T) {
 	tests := []struct {
 		name   string

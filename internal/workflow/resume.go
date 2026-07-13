@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,7 +34,7 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 	if cfg.TempName != "" && cfg.TempName != state.TempName {
 		return fmt.Errorf("--temp-name must match persisted operation value %s", state.TempName)
 	}
-	if cfg.Image != state.Image || cfg.RsyncExtraArgs != state.RsyncExtraArgs || cfg.RunAsUser != state.RunAsUser {
+	if cfg.Image != state.Image || !slices.Equal(cfg.RsyncArgs, state.RsyncArgs) || cfg.RunAsUser != state.RunAsUser {
 		return fmt.Errorf("image, rsync arguments, and run-as settings must match the persisted operation")
 	}
 
@@ -122,7 +123,7 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 		fmt.Fprintf(cfg.IOStreams.Out, "Resuming copy %s -> %s...\n", state.TempName, state.SourceName)
 		if err := mover.Move(ctx, datamover.Request{
 			Namespace: namespace, SourcePVC: state.TempName, DestPVC: state.SourceName, Image: state.Image,
-			JobName: naming.SafeDNSLabel("shrink-copy-back-" + state.SourceName), ExtraArgs: state.RsyncExtraArgs,
+			JobName: naming.SafeDNSLabel("shrink-copy-back-" + state.SourceName), Args: state.RsyncArgs,
 			RunAsUser: state.RunAsUser, FSGroup: state.FSGroup,
 			WaitTimeout: cfg.Timeout, PollInterval: pollInterval,
 		}); err != nil {
