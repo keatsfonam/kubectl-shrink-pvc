@@ -133,6 +133,11 @@ func TestNormalizeRsyncArgs(t *testing.T) {
 	if _, err := normalizeRsyncArgs([]string{"unexpected-operand"}, ""); err == nil {
 		t.Fatal("expected operand rejection")
 	}
+	for _, arg := range []string{"--no-perms", "--chmod=Du=rwx", "-pog"} {
+		if _, err := normalizeRsyncArgs([]string{arg}, ""); err == nil || !strings.Contains(err.Error(), "metadata preservation policy") {
+			t.Fatalf("expected metadata policy rejection for %q, got %v", arg, err)
+		}
+	}
 }
 
 func TestRequiredBytesWithMargin(t *testing.T) {

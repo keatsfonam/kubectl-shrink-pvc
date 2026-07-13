@@ -481,8 +481,28 @@ func normalizeRsyncArgs(args []string, legacy string) ([]string, error) {
 		if arg == "" || !strings.HasPrefix(arg, "-") {
 			return nil, fmt.Errorf("rsync arguments must be options beginning with '-' and values must use --option=value: %q", arg)
 		}
+		if changesRsyncMetadataPolicy(arg) {
+			return nil, fmt.Errorf("rsync argument %q changes the metadata preservation policy and cannot be verified safely", arg)
+		}
 	}
 	return result, nil
+}
+
+func changesRsyncMetadataPolicy(arg string) bool {
+	if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") && strings.ContainsAny(strings.TrimPrefix(arg, "-"), "pogtAXH") {
+		return true
+	}
+	for _, prefix := range []string{
+		"--chmod", "--chown", "--usermap", "--groupmap",
+		"--no-perms", "--no-owner", "--no-group", "--no-times",
+		"--no-acls", "--no-xattrs", "--no-hard-links",
+		"--perms", "--owner", "--group", "--times", "--acls", "--xattrs", "--hard-links",
+	} {
+		if arg == prefix || strings.HasPrefix(arg, prefix+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func requiredBytesWithMargin(usedBytes int64, marginPercent int) (int64, error) {
