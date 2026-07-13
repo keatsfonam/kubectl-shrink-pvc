@@ -292,10 +292,12 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	if err := mover.Verify(ctx, copyBack); err != nil {
 		return err
 	}
-	restoreOnExit = true
 	if err := updatePhase(operation.PhaseCopiedBack); err != nil {
 		return err
 	}
+	// Consumers may only be restored after copy-back is durably checkpointed;
+	// otherwise resume could repeat rsync while applications are writing.
+	restoreOnExit = true
 	if scaled {
 		restoreCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 		err := kube.RestoreDeployments(restoreCtx, client, plan.Deployments)

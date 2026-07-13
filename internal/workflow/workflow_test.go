@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -43,6 +44,31 @@ func TestRevalidateExecutionPlanRejectsChangedSourceUID(t *testing.T) {
 	_, _, err := revalidateExecutionPlan(context.Background(), client, "ns", "data", approvedSource, &kube.ConsumerPlan{}, true)
 	if err == nil || !strings.Contains(err.Error(), "was replaced after planning") {
 		t.Fatalf("expected source replacement error, got %v", err)
+	}
+}
+
+func TestResumeRejectsReplacedSourceBeforeRestoration(t *testing.T) {
+	finalPVC := pvc("data", "ns", "1Gi")
+	operation.StampRecreatedPVC(finalPVC, "op")
+	finalJSON, err := json.Marshal(finalPVC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := fake.NewSimpleClientset(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "ns", UID: "replacement"}})
+	store := operation.Store{Client: client, Namespace: "ns", Name: operation.NameForPVC("data")}
+	state := &operation.State{
+		Version: 1, OperationID: "op", Namespace: "ns", SourceName: "data",
+		OriginalSourceUID: "original", RecreatedSourceUID: "expected", TempName: "temp", TempUID: "temp-uid",
+		TargetSize: "1Gi", Image: "image", RunAsUser: -1, FSGroup: -1,
+		FinalPVCJSON: finalJSON, Phase: operation.PhaseCopiedBack,
+	}
+	if _, err := store.Create(context.Background(), state); err != nil {
+		t.Fatalf("create state: %v", err)
+	}
+
+	err = resume(context.Background(), Config{PVCName: "data", Image: "image", RunAsUser: -1, FSGroup: -1}, client, "ns", resource.MustParse("1Gi"))
+	if err == nil || !strings.Contains(err.Error(), "replaced before restoration") {
+		t.Fatalf("expected replacement error, got %v", err)
 	}
 }
 

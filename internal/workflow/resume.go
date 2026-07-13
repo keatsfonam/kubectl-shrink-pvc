@@ -141,6 +141,16 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 	if state.Phase != operation.PhaseCopiedBack {
 		return fmt.Errorf("unsupported persisted operation phase %q", state.Phase)
 	}
+	recreated, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, state.SourceName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("validate recreated source before restoration: %w", err)
+	}
+	if recreated.UID != state.RecreatedSourceUID {
+		return fmt.Errorf("recreated source PVC %s/%s was replaced before restoration", namespace, state.SourceName)
+	}
+	if err := operation.ValidateRecreatedPVC(recreated, state.OperationID); err != nil {
+		return fmt.Errorf("validate recreated source before restoration: %w", err)
+	}
 	if len(state.Deployments) > 0 && !state.NoScale {
 		restoreCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 		err := kube.RestoreDeployments(restoreCtx, client, state.Deployments)
