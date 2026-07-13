@@ -489,11 +489,11 @@ func normalizeRsyncArgs(args []string, legacy string) ([]string, error) {
 }
 
 func changesRsyncMetadataPolicy(arg string) bool {
-	if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") && strings.ContainsAny(strings.TrimPrefix(arg, "-"), "pogtAXH") {
+	if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") && strings.ContainsAny(strings.TrimPrefix(arg, "-"), "apogtAXH") {
 		return true
 	}
 	for _, prefix := range []string{
-		"--chmod", "--chown", "--usermap", "--groupmap",
+		"--archive", "--chmod", "--chown", "--usermap", "--groupmap",
 		"--no-perms", "--no-owner", "--no-group", "--no-times",
 		"--no-acls", "--no-xattrs", "--no-hard-links",
 		"--perms", "--owner", "--group", "--times", "--acls", "--xattrs", "--hard-links",
