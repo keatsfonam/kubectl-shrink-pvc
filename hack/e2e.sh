@@ -136,7 +136,11 @@ kubectl -n "$ns" rollout status deploy/app-failcopy --timeout=180s
 [[ $(pvc_size failcopy) == 1Gi ]] || fail "copy failure changed source PVC size"
 fail_got=$(checksum failcopy)
 [[ $fail_got == "$fail_want" ]] || fail "copy failure changed source data: $fail_got != $fail_want"
-kubectl -n "$ns" get configmap failcopy-shrink-state >/dev/null 2>&1 && fail "copy failure persisted destructive state"
+prepared_state=$(kubectl -n "$ns" get configmap failcopy-shrink-state -o jsonpath='{.data.state\.json}')
+echo "$prepared_state" | grep -q '"phase":"Prepared"' || fail "copy failure did not retain a Prepared recovery checkpoint"
+"$bin" failcopy --size 512Mi -n "$ns" --resume --image "$E2E_ALPINE_IMAGE"
+kubectl -n "$ns" get configmap failcopy-shrink-state >/dev/null 2>&1 && fail "Prepared recovery did not clean operation state"
+kubectl -n "$ns" get pvc failcopy-shrink-tmp >/dev/null 2>&1 && fail "Prepared recovery did not clean the unverified temp PVC"
 
 echo "=== full replace as root preserves PVC and filesystem metadata"
 kubectl -n "$ns" exec deploy/app-data -- chown 123:234 /data/files/blob1
