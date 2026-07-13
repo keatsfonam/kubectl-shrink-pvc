@@ -47,6 +47,36 @@ func TestRevalidateExecutionPlanRejectsChangedSourceUID(t *testing.T) {
 	}
 }
 
+func TestResumeRequiresRecoveryPVCBeforeDeletingSource(t *testing.T) {
+	finalPVC := pvc("data", "ns", "1Gi")
+	operation.StampRecreatedPVC(finalPVC, "op")
+	finalJSON, err := json.Marshal(finalPVC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "ns", UID: "original"}}
+	client := fake.NewSimpleClientset(source)
+	store := operation.Store{Client: client, Namespace: "ns", Name: operation.NameForPVC("data")}
+	state := &operation.State{
+		Version: 1, OperationID: "op", Namespace: "ns", SourceName: "data",
+		OriginalSourceUID: "original", TempName: "missing-temp", TempUID: "temp-uid",
+		TargetSize: "1Gi", Image: "image", RunAsUser: -1, FSGroup: -1,
+		FinalPVCJSON: finalJSON, Phase: operation.PhaseCopiedToTemp,
+	}
+	if _, err := store.Create(context.Background(), state); err != nil {
+		t.Fatalf("create state: %v", err)
+	}
+
+	err = resume(context.Background(), Config{PVCName: "data", Image: "image", RunAsUser: -1, FSGroup: -1}, client, "ns", resource.MustParse("1Gi"))
+	if err == nil || !strings.Contains(err.Error(), "temporary recovery PVC") {
+		t.Fatalf("expected missing recovery PVC error, got %v", err)
+	}
+	got, getErr := client.CoreV1().PersistentVolumeClaims("ns").Get(context.Background(), "data", metav1.GetOptions{})
+	if getErr != nil || got.UID != "original" {
+		t.Fatalf("original source was changed: pvc=%#v err=%v", got, getErr)
+	}
+}
+
 func TestResumeRejectsReplacedSourceBeforeRestoration(t *testing.T) {
 	finalPVC := pvc("data", "ns", "1Gi")
 	operation.StampRecreatedPVC(finalPVC, "op")

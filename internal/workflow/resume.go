@@ -60,6 +60,10 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 	mover := datamover.RsyncMover{Client: client}
 
 	if state.Phase == operation.PhaseCopiedToTemp {
+		// Recovery data must be present and owned before touching an intact source.
+		if _, err := loadOwnedTempPVC(ctx, client, state); err != nil {
+			return err
+		}
 		source, getErr := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, state.SourceName, metav1.GetOptions{})
 		switch {
 		case apierrors.IsNotFound(getErr):
@@ -103,12 +107,8 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 	}
 
 	if state.Phase == operation.PhaseSourceRecreated {
-		temp, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, state.TempName, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("get temporary PVC while resuming: %w", err)
-		}
-		if temp.UID != state.TempUID || temp.Annotations[operation.AnnotationOperationID] != state.OperationID {
-			return fmt.Errorf("temporary PVC %s/%s was replaced or is not owned by this operation", namespace, state.TempName)
+		if _, err := loadOwnedTempPVC(ctx, client, state); err != nil {
+			return err
 		}
 		recreated, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, state.SourceName, metav1.GetOptions{})
 		if err != nil {
@@ -169,4 +169,15 @@ func resume(ctx context.Context, cfg Config, client kubernetes.Interface, namesp
 	}
 	fmt.Fprintln(cfg.IOStreams.Out, "PVC shrink workflow resumed and completed successfully.")
 	return nil
+}
+
+func loadOwnedTempPVC(ctx context.Context, client kubernetes.Interface, state *operation.State) (*corev1.PersistentVolumeClaim, error) {
+	temp, err := client.CoreV1().PersistentVolumeClaims(state.Namespace).Get(ctx, state.TempName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get temporary recovery PVC before resuming: %w", err)
+	}
+	if temp.UID != state.TempUID || temp.Annotations[operation.AnnotationOperationID] != state.OperationID {
+		return nil, fmt.Errorf("temporary PVC %s/%s was replaced or is not owned by this operation", state.Namespace, state.TempName)
+	}
+	return temp, nil
 }
