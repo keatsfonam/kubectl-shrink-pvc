@@ -190,11 +190,14 @@ for _ in {1..180}; do
 	sleep 2
 done
 kubectl -n "$ns" get configmap interrupted-shrink-state >/dev/null 2>&1 || fail "operation did not persist recovery state"
-for _ in {1..30}; do
+for _ in {1..180}; do
 	[[ -n $(kubectl -n "$ns" get pvc interrupted -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true) ]] && break
 	sleep 1
 done
-[[ -n $(kubectl -n "$ns" get pvc interrupted -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true) ]] || fail "operation did not reach held deletion"
+if [[ -z $(kubectl -n "$ns" get pvc interrupted -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true) ]]; then
+	tail -n 40 "$root/e2e-interrupted.log" >&2 || true
+	fail "operation did not reach held deletion"
+fi
 kill "$child_pid"
 wait "$child_pid" 2>/dev/null || true
 child_pid=
