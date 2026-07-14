@@ -24,7 +24,7 @@ See [live progress behavior](docs/progress.md) for the portable signals, output 
 Download the archive for your platform from the [releases page](https://github.com/keatsfonam/kubectl-shrink-pvc/releases), unpack it, and put `kubectl-shrink_pvc` on your `PATH`:
 
 ```sh
-version=v0.5.0
+version=v0.6.0
 tar -xzf "kubectl-shrink-pvc_${version}_darwin_arm64.tar.gz"
 install -m 0755 kubectl-shrink_pvc /usr/local/bin/kubectl-shrink_pvc
 kubectl shrink-pvc --help
@@ -129,7 +129,7 @@ cosign verify-blob \
   --certificate-identity-regexp='^https://github.com/keatsfonam/kubectl-shrink-pvc/.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   checksums.txt
-gh attestation verify kubectl-shrink-pvc_v0.5.0_linux_amd64.tar.gz \
+gh attestation verify kubectl-shrink-pvc_v0.6.0_linux_amd64.tar.gz \
   --repo keatsfonam/kubectl-shrink-pvc
 ```
 
