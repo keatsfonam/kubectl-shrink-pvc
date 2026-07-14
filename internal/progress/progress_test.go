@@ -20,7 +20,11 @@ func TestTerminalInfoRejectsNonTerminalWriters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("close progress output: %v", err)
+		}
+	})
 	if terminal, width := terminalInfo(file); terminal || width != 0 {
 		t.Fatalf("regular file terminal info = (%t, %d), want (false, 0)", terminal, width)
 	}
