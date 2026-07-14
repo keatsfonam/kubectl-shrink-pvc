@@ -3,12 +3,28 @@ package progress
 import (
 	"bytes"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
 )
+
+func TestTerminalInfoRejectsNonTerminalWriters(t *testing.T) {
+	if terminal, width := terminalInfo(&bytes.Buffer{}); terminal || width != 0 {
+		t.Fatalf("buffer terminal info = (%t, %d), want (false, 0)", terminal, width)
+	}
+
+	file, err := os.CreateTemp(t.TempDir(), "progress-output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if terminal, width := terminalInfo(file); terminal || width != 0 {
+		t.Fatalf("regular file terminal info = (%t, %d), want (false, 0)", terminal, width)
+	}
+}
 
 func TestNonTTYRenderingIncludesMonotonicElapsedAndResetsPhaseTimer(t *testing.T) {
 	var out bytes.Buffer

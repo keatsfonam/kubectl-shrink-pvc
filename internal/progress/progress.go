@@ -12,8 +12,6 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
-
-	"golang.org/x/term"
 )
 
 // Phase is a display-only workflow phase. These values are intentionally
@@ -539,12 +537,11 @@ func terminalInfo(writer io.Writer) (bool, int) {
 	if !ok {
 		return false, 0
 	}
-	fd := int(fdWriter.Fd())
-	if !term.IsTerminal(fd) {
+	width, terminal := terminalWidth(fdWriter.Fd())
+	if !terminal {
 		return false, 0
 	}
-	width, _, err := term.GetSize(fd)
-	if err != nil || width <= 0 {
+	if width <= 0 {
 		width = defaultTTYWidth
 	}
 	return true, width
